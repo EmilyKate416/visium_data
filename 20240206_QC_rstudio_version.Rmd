@@ -1,0 +1,1277 @@
+---
+title: "20240206_QC_final_workflow"
+output: html_document
+date: "2024-02-06"
+---
+#' ---
+#' # Workflow Documentation
+#' 
+#' ## Environment setup
+#' - To open RStudio locally:
+#'   ```bash
+#'   mamba activate r_spatial
+#'   rstudio
+#'   ```
+#' - For analyses on scratchc, run in ssh terminal:
+#'   ```bash
+#'   cd /mnt/scratchc/fmlab/lythgo02/visium_data/
+#'   ```
+#' 
+#' Example batch submission:
+#' ```bash
+#' for SAMPLE in SITSA3 SITSB2 ...; do 
+#'   sbatch --job-name=${SAMPLE} \
+#'          --output=logs/${SAMPLE}.out \
+#'          --error=logs/${SAMPLE}.err \
+#'          --time=100:00:00 --mem=32G --cpus-per-task=8 --partition=epyc \
+#'          --wrap="Rscript single_sample_process_logmito.r ${SAMPLE}"
+#' done
+#' ```
+#' (repeat for “arbitrary” and `nnsvg_*` scripts as appropriate)
+#' 
+
+
+#' # Purpose
+#' Visium ST pipeline with parallelised loading/preprocessing,
+#' cohort-specific QC (fixed vs. sample-specific mito thresholds), normalization,
+#' HVG/SVG feature selection, dimensionality reduction, clustering, and marker discovery.
+#'
+#' # Inputs
+#' - Visium Spaceranger output directories (one per sample)
+#'   - Each contains: filtered_feature_bc_matrix/, spatial/ (tissue positions, images)
+#' - Sample ID list (vector `samplesheet`) 
+#' - Gene annotations via AnnotationHub (EnsDb v109, Homo sapiens) for chromosome/mito flags
+#' - Optional: predefined cohort assignment (e.g., `cohort_log` vs. remaining samples)
+#'
+#' # Outputs
+#' - QC summaries & plots per sample/cohort:
+#'   - UMI/library size, detected genes, mito% (linear & log scale), spot maps
+#'   - Tables of outliers and retained spots (DT)
+#' - Filtered objects:
+#'   - `spe_filt1` (log-MAD mito cohort), `spe_filt2` (fixed 20% mito cohort)
+#'   - Combined filtered object: `spe_filt <- cbind(spe_filt1, spe_filt2)`
+#'   - Checkpoint RDS files at key stages (e.g., post-QC, post-libfactors), e.g.:
+#'     - `YYYYMMDD_post_genefilter_QC_arbitrary_and_log_mito.rds`
+#'     - `YYYYMMDD_post_computelibfactors_arbitrary_and_log_mito.rds`
+#' - Normalized data:
+#'   - `logNormCounts` applied to combined object or per-sample list (rebinding supported)
+#' - Feature sets & models:
+#'   - HVGs from `scran::modelGeneVar` + `getTopHVGs`
+#'   - SVGs from `nnSVG` (results in `rowData`; helper `getTopSVGs()` included)
+#'   - Stored reduced dimensions:
+#'     - `PCA_HVGs`, `PCA_SVGs`, and concatenated `PCA_combined`
+#' - DR & clustering visuals:
+#'   - PCA variance, UMAP, spatial/PCA/UMAP cluster maps
+#' - Marker discovery:
+#'   - `findMarkers()` outputs per cluster; example heatmaps of logFCs
+#'
+#' # Notes
+#' - Cohort logic:
+#'   - Cohort 1: mito outliers by sample using median + 3×MAD on **log** mito%
+#'   - Cohort 2: fixed 20% mito threshold
+#' - Parallel IO & preprocessing with `bplapply`; barcode standardisation per sample
+#' - Paths: set `projDir` and `<visium_root>` to your environment before running
+
+#' The following is for running on mnt/nas
+#'
+#' Workflow for:
+#'
+#' Gene annotation:
+#' - Source: AnnotationHub / EnsDb
+#'
+#' Per-spot QC:
+#' - Filtering is based on threshold decisions:
+#'   - UMIs < 300 → filter out
+#'   - Genes < 300 → filter out
+#'   - Mitochondrial % > 20% → filter out
+#'
+#' Normalisation:
+#' - Logcounts based on library size factors
+#' - Raw counts for genes are divided by the size factor for that spot
+#' - log-transformed so downstream analyses focus on genes with strong relative differences
+#' - Implemented with scater::logNormCounts()
+#'
+#' Feature selection:
+#' - Calculate highly variable genes (HVGs) to retain informative genes and remove noise
+#' - Method: scran (Lun, McCarthy, and Marioni 2016)
+#' - HVGs = genes with largest biological variance across spots
+#' - Used to define major cell types
+#'
+#' Dimensionality reduction (on HVGs):
+#' - Genes are correlated if influenced by the same biological processes
+#' - Reduce feature space to fewer dimensions → clustering more efficient
+#' - Methods:
+#'   - PCA (principal components analysis) → interpretable, used for downstream analysis
+#'   - t-SNE / UMAP → non-linear, for visualisation only
+#'
+#' Batch correction (integrating separate samples):
+#' - QC, normalise, and fit mean-variance model (scran::modelGeneVar) for each dataset separately
+#' - Subset to only genes common across batches (accounting for filtered differences)
+#' - Rescale batches to account for sequencing depth differences
+#'   (log-normalisation alone does not address depth variation)
+#' - Select variable genes by averaging per-batch variance estimates
+#' - Result: HVGs that are highly variable across all batches, enabling joint analysis
+
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+library(SpatialExperiment) #in terminal: mamba install bioconda::bioconductor-spatialexperiment
+
+#sudo Rscript -e 'if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager", repos =                     "https://cran.rstudio.com"); BiocManager::install("SpatialExperiment")'
+                                  #if this fails due to magick, first run:  sudo apt-get update
+                                                                   # then: sudo apt-get install libmagick++-dev
+                                                                   # then sudo R to open R session and install.packages("magick")     
+library(scater)
+library(AnnotationHub)
+library(tidyverse)
+library(ggspavis)
+library(scran)
+library(BiocParallel)
+library(DT)
+bpp <- MulticoreParam(workers = 16, progressbar = TRUE) #to use with bplapply to spread comp expensive tasks across processors
+register(bpp)
+
+bpstart(bpp) #restart cluster
+# Check if it is active
+bpisup(bpp)
+
+projDir = "/mnt/fmlab/group_folders/lythgo02/Spatial/"
+```
+
+```{r, load data for one sample}
+#read in spaceranger output, by default this is the tissue spots only
+
+load_data <- "/mnt/fmlab/group_folders/lythgo02/visium_data/SITSA1"
+
+spe <- read10xVisium(samples = load_data)
+```
+
+
+
+
+```{r}
+load_all_data <- "/mnt/fmlab/group_folders/lythgo02/visium_data/"
+
+# List files in the directory
+files <- list.files(path = load_all_data, pattern = "^SITS", full.names = TRUE)
+
+# Subset to exclude this file (which I think is in the wrong location anyway)
+files <- files[!grepl("SITSA2\\.mri\\.tgz", files)] 
+
+# Print out the list of files
+print(files)
+
+#assign names so they are loaded into the spe with the correct identifiers
+samplesheet <- c("SITSA1", "SITSA2", "SITSA3", "SITSA4", 
+                 "SITSB1", "SITSB2", "SITSB3", "SITSB4", 
+                 "SITSC1", "SITSC2", "SITSC3", "SITSC4",
+                 "SITSD1", "SITSD2", "SITSD3", "SITSD4",
+                 "SITSE2", "SITSE4",
+                 "SITSF2", "SITSF4",
+                 "SITSG2", "SITSH2")
+
+names(files) <- samplesheet
+
+# Initialize a list to store each sample
+spe_list <- list()
+
+# Loop through each file and process it
+for (sample_name in names(files)) {
+  # Read the Visium data
+  spe <- read10xVisium(samples = files[sample_name])
+
+  # Add unique barcodes
+  spe$barcode <- rownames(colData(spe))
+  spe$barcodeid <- gsub("-1$", paste0("-", sample_name), spe$barcode)
+  rownames(colData(spe)) <- spe$barcodeid
+
+  # Store the processed sample in the list
+  spe_list[[sample_name]] <- spe
+}
+
+# Combine all processed samples into one SpatialExperiment object
+spe <- do.call(cbind, spe_list)
+```
+
+
+
+```{r or load data for all samples or a subset}
+load_all_data <- "/mnt/fmlab/group_folders/lythgo02/visium_data/"
+#load_all_data <- "/run/user/1804238067/gvfs/sftp:host=clust1-sub-2,user=lythgo02/scratchc/fmlab/lythgo02/visium_data"
+  
+# List files in the directory
+files <- list.files(path = load_all_data, pattern = "^SITS", full.names = TRUE)
+
+# Subset to exclude this file (which I think is in the wrong location anyway)
+files <- files[!grepl("SITSA2\\.mri\\.tgz", files)] 
+
+# Print out the list of files
+print(files)
+
+#assign names so they are loaded into the spe with the correct identifiers
+samplesheet <- c("SITSA1", "SITSA2", "SITSA3", "SITSA4", 
+                 "SITSB1", "SITSB2", "SITSB3", "SITSB4", 
+                 "SITSC1", "SITSC2", "SITSC3", "SITSC4",
+                 "SITSD1", "SITSD2", "SITSD3", "SITSD4",
+                 "SITSE2", "SITSE4",
+                 "SITSF2", "SITSF4",
+                 "SITSG2", "SITSH2")
+
+names(files) <- samplesheet
+
+#function to process in parallel
+process_ST <- function(sample_name, files){
+  spe <- read10xVisium(samples = files[sample_name])
+  spe$barcode <- rownames(colData(spe)) # Add unique barcodes
+  spe$barcodeid <- gsub("-1$", paste0("-", sample_name), spe$barcode) #modify barcode to include sample name
+  rownames(colData(spe)) <- spe$barcodeid #assign barcode as rownames
+  return(spe)
+ }
+
+# Now use `bplapply` and pass `files` to the workers
+spe_list <- bplapply(names(files), process_ST, files = files)
+
+# Convert list to named format
+names(spe_list) <- names(files)
+
+# Combine all samples into one SpatialExperiment object
+spe <- do.call(cbind, spe_list)
+
+```
+
+
+```{r, annotation}
+# This bit gets more annotation than just the gene name that given by spaceranger. For example we need which chromosome its on to check if its mitochondrial.
+ah <- AnnotationHub()
+# change this to whichever species etc. you require
+HumanEnsDb <- query(ah, c("EnsDb", "Homo sapiens", "109"))[[1]]
+annotations <- genes(HumanEnsDb, return.type = "data.frame")  %>%
+  dplyr::select(gene_id, seq_name) %>%
+  dplyr::rename(ID=gene_id)
+
+# adds the new info to a version of the rowdata (gene info) from the spe object
+gene_metadata <- as.data.frame(rowData(spe)) %>%
+  mutate(ID = rownames(.)) %>%
+  left_join(annotations, by = "ID") %>%
+  dplyr::rename(Chromosome=seq_name)
+
+# it must be a DataFrame not a data.frame to fit back into the spe object
+rowData(spe) <- DataFrame(gene_metadata) 
+
+# this changes the rownames so they are the gene name if we have it but stay as the ensembl id if not
+rownames(spe) <- uniquifyFeatureNames(rowData(spe)$ID,
+                                      rowData(spe)$symbol)
+
+```
+
+```{r, "zero counts"}
+# This bit just gets rid of any genes that we haven't detected in any spot
+rowsWithZeroCounts <- rowSums(counts(spe)) == 0
+
+spe <- spe[!rowsWithZeroCounts, ]
+
+#saveRDS(spe, "20241217_post_!rowsWithZeroCounts.rds") #because the steo above can take a long time to run
+```
+
+
+
+
+```{r}
+# subset to keep only spots over tissue
+spe <- spe[, colData(spe)$in_tissue == 1]
+dim(spe)
+```
+
+We have `r nrow(spe)` genes that have been detected in `r ncol(spe)` spots manually annotated prior to spaceranger as being covered by tissue.
+
+```{r, plot spots}
+#initialise a list to store each sample
+spe_subset <- list()
+
+# Initialize an empty list to store plots
+plot_spots <- list()
+
+for (sample_id in samplesheet) {
+  spe_subset[[sample_id]] <-  spe[, colData(spe)$sample_id==sample_id]
+plot_spots[[sample_id]] <-
+plotSpots(spe_subset[[sample_id]]) }
+
+#to view plot_spots[[1]]
+# Example: Display the first 1 plots in plot_spot in a 2x2 grid
+gridExtra::grid.arrange(grobs = plot_spots[1:11], ncol = 4)
+gridExtra::grid.arrange(grobs = plot_spots[12:22], ncol = 4)
+
+
+spots <- plotSpots(spe) +
+  facet_wrap(~spe$sample_id) 
+
+#ggsave("plots/20241219_spotsdetected.png")
+
+```
+
+These are the spots spaceranger determined we covered by tissue.
+
+```{r per spot QC}
+# calculate per-spot QC metrics and store in colData (from scRNA approach)
+# detected = how many genes in that spot
+#sum = how many UMIs in that spot
+#subsets_Mito_percent = the percentage of UMIs that come from a mitochondrial gene
+
+spe <- addPerCellQC(spe, 
+                    subsets = list(Mito = which(rowData(spe)$Chromosome == "MT")))
+
+# this just makes a table of the stuff for the report
+colData(spe) %>%
+  as_tibble() %>%
+  group_by(sample_id) %>%
+  summarize(
+    `Number of spots` = n(),
+    `Median genes per spot` = round(median(detected)),
+    `Median number of UMIs per spot` = round(median(sum)),
+    `Total number of UMIs` = sum(sum),
+    `Total mito UMIs` = sum(subsets_Mito_sum, na.rm = TRUE),  # Total mito UMIs per sample
+    `Mito percent` = (`Total mito UMIs` / `Total number of UMIs`) * 100  # Compute % mito reads
+  ) %>%
+  ungroup() %>%
+  datatable(rownames = FALSE, options = list(dom = 't'))
+
+#saveRDS(spe, "20250203_post_addpercellQC.rds") #because the steo above can take a long time to run
+
+spe<- readRDS("20250203_post_addpercellQC.rds")
+```
+```{r}
+# Define the sample IDs for each cohort
+cohort_log <- c("SITSA3", "SITSB2", "SITSE4","SITSC3", "SITSF4", "SITSF2", "SITSC1", "SITSD3", "SITSB4")
+cohort_arbitrary <- setdiff(unique(colData(spe)$sample_id), cohort_log)  # Remaining samples
+
+# Split `spe` into two cohorts
+spe_cohort1 <- spe[, colData(spe)$sample_id %in% cohort_log]
+spe_cohort2 <- spe[, colData(spe)$sample_id %in% cohort_arbitrary]
+
+# Check the dimensions or other details
+dim(spe_cohort1)  # Number of spots and features in cohort 1
+dim(spe_cohort2)  # Number of spots and features in cohort 2
+```
+
+
+
+##The simplest option to apply the QC metrics is to select thresholds for each metric, 
+and remove any spots that do not meet the thresholds for one or more metrics. Exploratory
+visualizations can be used to help select appropriate thresholds
+```{r lib size}
+#library size = total UMI counts per spot (in sum column)
+# histogram of library sizes across spots
+hist(colData(spe_cohort1)$sum, breaks = 20)
+hist(colData(spe_cohort2)$sum, breaks = 20)
+#check the distribution is smooth and there are no obvious issues like spike at low lib sizes
+# Filter the spe object where the sum is greater than 0
+
+#set a relatively arbitrary threshold of 600 UMI counts per spot (as per tutorial) 
+#and then check the number of spots below this thresholdI change this looking at the plots
+qc_lib_size1 <- colData(spe_cohort1)$sum < 300
+colData(spe_cohort1)$qc_lib_size1 <- colData(spe_cohort1)$sum < 300
+table(qc_lib_size1)
+
+qc_lib_size2 <- colData(spe_cohort2)$sum < 300
+colData(spe_cohort2)$qc_lib_size2 <- colData(spe_cohort2)$sum < 300
+table(qc_lib_size2)
+
+umi <- plotColData(spe_cohort1, y = "sum", x = "sample_id", colour_by = "qc_lib_size1") +
+  labs(title = "Total number of UMIs for each spot across all genes",
+       y = "Total UMI count (library size)", x = "Sample Name") +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+#ggsave("plots/20250204_umi_qc.png", plot = umi,width= 8, height = 6, units = "in")
+umi <- plotColData(spe_cohort2, y = "sum", x = "sample_id", colour_by = "qc_lib_size2") +
+  labs(title = "Total number of UMIs for each spot across all genes",
+       y = "Total UMI count (library size)", x = "Sample Name") +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+spe_plot1 <- spe_cohort1
+colData(spe_plot1)$sum <- colData(spe_plot1)$sum + 0.1
+
+spe_plot2 <- spe_cohort2
+colData(spe_plot2)$sum <- colData(spe_plot2)$sum + 0.1
+
+umi_log <- plotColData(spe_plot1, y = "sum", x = "sample_id", colour_by = "qc_lib_size1") +
+  labs(
+    title = "Total number of UMIs for each spot across all genes",
+    y = "Log of total UMI count (library size)", x = "Sample Name"
+  ) +
+theme(legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  scale_y_log10()
+
+
+umi_log <- plotColData(spe_plot2, y = "sum", x = "sample_id", colour_by = "qc_lib_size2") +
+  labs(
+    title = "Total number of UMIs for each spot across all genes",
+    y = "Log of total UMI count (library size)", x = "Sample Name"
+  ) +
+theme(legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  scale_y_log10()
+#ggsave("plots/20250204_umi_qc_log.png", plot = umi_log, width = 8, height = 6, units = "in")
+
+```
+
+
+```{r QC library size - threshold}
+
+# plots all the umi level info as gradients (useful to see if its spatially affected)
+plotSpots(spe_cohort1, , 
+       annotate = "qc_lib_size1") + facet_wrap(~spe_cohort1$sample_id)
+
+plotSpots(spe_cohort2, , 
+       annotate = "qc_lib_size2") + facet_wrap(~spe_cohort2$sample_id)
+#check that the discarded spots do not have any obvious spatial pattern that correlates 
+#with known biological features. Otherwise, removing these spots could indicate that we 
+#have set the threshold too high, and are removing biologically informative spots
+
+# plots your final decisions
+plotSpotQC(spe_cohort1, plot_type = "spot", 
+       annotate = "qc_lib_size1") + facet_wrap(~spe_cohort1$sample_id)
+
+# plots your final decisions
+plotSpotQC(spe_cohort2, plot_type = "spot", 
+       annotate = "qc_lib_size2") + facet_wrap(~spe_cohort2$sample_id)
+
+#ggsave("plots/20250204_spotsexcluded_librarysize.png")
+```
+
+
+
+```{r QC genes detected per spot}
+# histogram of numbers of expressed genes
+hist(colData(spe_cohort1)$detected, breaks = 20)
+
+hist(colData(spe_cohort2)$detected, breaks = 20)
+#arbitrary threshold of < 300 genes detected
+qc_genes_detected1 <- colData(spe_cohort1)$detected < 300
+colData(spe_cohort1)$qc_genes_detected1 <- colData(spe_cohort1)$detected < 300
+
+qc_genes_detected2 <- colData(spe_cohort2)$detected < 300
+colData(spe_cohort2)$qc_genes_detected2 <- colData(spe_cohort2)$detected < 300
+     
+plotColData(spe_cohort1, y = "detected", x = "sample_id", colour_by="qc_genes_detected1") +
+  labs(y = "Number of detected genes", x = "Sample Name", title = "Genes detected per spot") +
+    theme(legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+#ggsave("plots/20250204_genes_detected.png", width = 8, height = 6, units = "in")
+
+plotSpotQC(spe_cohort1, plot_type = "spot", annotate = "qc_genes_detected1") +
+  facet_wrap(~spe_cohort1$sample_id)
+
+     
+plotColData(spe_cohort2, y = "detected", x = "sample_id", colour_by="qc_genes_detected2") +
+  labs(y = "Number of detected genes", x = "Sample Name", title = "Genes detected per spot") +
+    theme(legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+#ggsave("plots/20250204_genes_detected.png", width = 8, height = 6, units = "in")
+
+plotSpotQC(spe_cohort2, plot_type = "spot", annotate = "qc_genes_detected2") +
+  facet_wrap(~spe_cohort2$sample_id)
+
+#ggsave("plots/20250204_spotexclusion_genesdetected.png")
+
+
+
+
+```
+
+
+
+```{r genes v lib}
+# its expected to see some coorelation here as the more UMIs you have from a spot in theory the more genes you will sample.
+colData(spe_cohort1) %>%
+  as_tibble() %>%
+  ggplot(mapping = aes(x = detected, y = sum)) +
+  geom_point(alpha = 0.4, size = 0.5) +
+  labs(
+    x = "Number of genes detected",
+    y = "Library size"
+  ) +
+  theme_bw() + 
+  facet_wrap(~spe_cohort1$sample_id)
+
+colData(spe_cohort2) %>%
+  as_tibble() %>%
+  ggplot(mapping = aes(x = detected, y = sum)) +
+  geom_point(alpha = 0.4, size = 0.5) +
+  labs(
+    x = "Number of genes detected",
+    y = "Library size"
+  ) +
+  theme_bw() + 
+  facet_wrap(~spe_cohort2$sample_id)
+```
+### high mito content indicates cell damage
+```{r mito}
+is_mito1 <- grepl("(^MT-)|(^mt-)", rowData(spe_cohort1)$symbol)
+table(is_mito1)
+
+
+mito_outlier_stats_arbitrary <- as.data.frame(colData(spe_cohort1)) %>%
+  group_by(sample_id) %>%
+  summarise(
+    total_spots = n(),  # Total spots per sample
+    mito_outlier_spots = sum(subsets_Mito_percent > 20, na.rm = TRUE),  # Spots with >20% mito
+    mito_outlier_percentage = (mito_outlier_spots / total_spots)*100  # Proportion of outliers
+  )
+
+is_mito2 <- grepl("(^MT-)|(^mt-)", rowData(spe_cohort2)$symbol)
+table(is_mito2)
+
+
+mito_outlier_stats_arbitrary <- as.data.frame(colData(spe_cohort2)) %>%
+  group_by(sample_id) %>%
+  summarise(
+    total_spots = n(),  # Total spots per sample
+    mito_outlier_spots = sum(subsets_Mito_percent > 20, na.rm = TRUE),  # Spots with >20% mito
+    mito_outlier_percentage = (mito_outlier_spots / total_spots)*100  # Proportion of outliers
+  )
+```
+
+```{r mito v genes}
+# This plot is more useful in single cell I think because alot of visiums just look like blob
+colData(spe_cohort1) %>%
+  as_tibble() %>%
+  ggplot(mapping = aes(x = detected, y = subsets_Mito_percent)) +
+  geom_point(alpha = 0.4, size = 0.5) +
+  labs(
+    x = "Number of genes detected",
+    y = "% UMIs from mitochonial genes"
+  ) +
+  theme_bw()  +facet_wrap(~spe_cohort1$sample_id)
+
+# This plot is more useful in single cell I think because alot of visiums just look like blob
+colData(spe_cohort2) %>%
+  as_tibble() %>%
+  ggplot(mapping = aes(x = detected, y = subsets_Mito_percent)) +
+  geom_point(alpha = 0.4, size = 0.5) +
+  labs(
+    x = "Number of genes detected",
+    y = "% UMIs from mitochonial genes"
+  ) +
+  theme_bw()  +facet_wrap(~spe_cohort2$sample_id)
+```
+
+
+#20% mito content is often set as an arbitrary threshold in single cell studies unless you are anticipating high mito content in your study
+#A few of he samples have rather high mito content so arbitrary threshold across all doesn't work, if we expect some mitochondrial content due to systematic/technical processes then we would expect this to show up fairly uniformly across samples. Given some really don't fit the trend, makes sense to calculate a sample specific mito threshold so spot exclusion based on mito content is specific to each sample. Exclude spots that are more than a particular standard deviation away from the mean. 
+
+```{r QC mito arbitrary cohort2}
+
+#arbitrary
+qc_mito <- colData(spe_cohort2)$subsets_Mito_percent > 20
+colData(spe_cohort2)$qc_mito <- colData(spe_cohort2)$subsets_Mito_percent >20
+
+plotColData(spe_cohort2, y = "subsets_Mito_percent", x = "sample_id", colour_by = "qc_mito") +
+  labs(y = "% UMIs from mitochonial genes", x = "Sample Name",
+       title= "Mitochondrial content") +
+  theme(legend.position = "none",
+   axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+#ggsave("plots/20250204_mito_content_qc_20.png", width = 8, height = 6, units = "in")
+
+
+plotSpotQC(spe_cohort2, plot_type = "spot", annotate = "qc_mito") +
+  facet_wrap(~spe_cohort2$sample_id)
+
+#ggsave("plots/20250204_spotexclusion_mito_20.png")
+```
+
+#sample specific thresholds without log transformation excludes too many
+
+```{r qc mito with sample specific threshold}
+
+# Calculate the sample-wise statistics (mean and sd)
+sample_stats <- as.data.frame(colData(spe_cohort1)) %>%
+  group_by(sample_id) %>%
+  summarise(
+   # mean_mito_percent = mean(subsets_Mito_percent, na.rm = TRUE),
+  #  sd_mito_percent = sd(subsets_Mito_percent, na.rm = TRUE),
+    median_mito_percent = median(subsets_Mito_percent, na.rm = TRUE),
+    mad_mito_percent = mad(subsets_Mito_percent, na.rm = TRUE)) # Calculate MAD for each sample
+    
+
+
+# Step 2: Add values to the colData(spe)
+colData(spe_cohort1)$mean_mito_percent <- sample_stats$mean_mito_percent[match(colData(spe_cohort1)$sample_id, sample_stats$sample_id)]
+colData(spe_cohort1)$sd_mito_percent <- sample_stats$sd_mito_percent[match(colData(spe_cohort1)$sample_id, sample_stats$sample_id)]
+colData(spe_cohort1)$median_mito_percent <- sample_stats$median_mito_percent[match(colData(spe_cohort1)$sample_id, sample_stats$sample_id)] 
+colData(spe_cohort1)$mad_mito_percent <- sample_stats$mad_mito_percent[match(colData(spe_cohort1)$sample_id, sample_stats$sample_id)]
+
+#step 4 upper outliers only (not absolute)
+colData(spe_cohort1)$deviation_from_median <- (colData(spe_cohort1)$subsets_Mito_percent - colData(spe_cohort1)$median_mito_percent)
+
+# Step 5: Flag as outlier if the absolute deviation exceeds 3 times the MAD
+colData(spe_cohort1)$is_outlier_mad <- colData(spe_cohort1)$deviation_from_median > (3 * colData(spe_cohort1)$mad_mito_percent)
+#is_outlier_mad <- colData(spe)$deviation_from_median > (3 * colData(spe)$mad_mito_percent)
+
+plotColData(spe_cohort1, y = "subsets_Mito_percent", x = "sample_id", colour_by = "is_outlier_mad") +
+  labs(y = "% UMIs from mitochonial genes", x = "Sample Name",
+       title= "Mitochondrial content") +
+  theme(legend.position = "none",
+   axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+#ggsave("plots/20250204_mitocontent_qc_samplespecific_upperoutliers.png", width = 8, height = 6, units = "in")
+
+plotSpotQC(spe_cohort1, plot_type = "spot", annotate = "is_outlier_mad") +
+  facet_wrap(~spe_cohort1$sample_id)
+
+#ggsave("plots/20241219_spotexclusion_mito_samplespecific_upperoutliers.png")
+
+```
+#seeing if log transformation of the mito content means some of the high content spots for SITC3 will be removed but doesn't look to alter things, compare numbers
+#Poor quality cells removed using a mitochondrial RNA percentage threshold calculated by the median + 3* median absolute deviation (of log mito values), cells above this threshold for each sample were removed
+```{r  log qc mito with sample specific threshold, upper outliers, eval=FALSE}
+#Log-transform the mito percentage, avoiding log(0) by adding constant
+colData(spe_cohort1)$log_mito_percent <- log(colData(spe_cohort1)$subsets_Mito_percent + 0.1)
+
+# Step 2: Compute the sample-wise statistics (median and MAD on log-transformed data)
+log_sample_stats <- as.data.frame(colData(spe_cohort1)) %>%
+  group_by(sample_id) %>%
+  summarise(
+    log_median_mito_percent = median(log_mito_percent, na.rm = TRUE),
+    log_mad_mito_percent = mad(log_mito_percent, na.rm = TRUE))
+
+
+# Step 3: Add the median and MAD to `colData(spe)`
+colData(spe_cohort1)$log_median_mito_percent <- log_sample_stats$log_median_mito_percent[match(colData(spe_cohort1)$sample_id, log_sample_stats$sample_id)]
+colData(spe_cohort1)$log_mad_mito_percent <- log_sample_stats$log_mad_mito_percent[match(colData(spe_cohort1)$sample_id, log_sample_stats$sample_id)]
+
+# Step 4: Calculate the deviation from the median (only for values above the median)
+colData(spe_cohort1)$log_deviation_above_median <- colData(spe_cohort1)$log_mito_percent - colData(spe_cohort1)$log_median_mito_percent
+
+# Step 5: Flag outliers as those where the deviation is greater than 3 times the MAD (only for positive deviations)
+colData(spe_cohort1)$log_is_outlier_mad <- colData(spe_cohort1)$log_deviation_above_median > (3 * colData(spe_cohort1)$log_mad_mito_percent)
+log_is_outlier_mad <- colData(spe_cohort1)$log_deviation_above_median > (3 * colData(spe_cohort1)$log_mad_mito_percent)
+
+plotColData(spe_cohort1, y = "subsets_Mito_percent", x = "sample_id", colour_by = "log_is_outlier_mad") +
+  labs(y = "% UMIs from mitochonial genes", x = "Sample Name",
+       title= "Mitochondrial content") +
+  theme(legend.position = "none",
+   axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+#ggsave("plots/20250204_logmitocontent_qc_samplespecific_upperoutliers.png", width = 8, height = 6, units = "in")
+
+plotSpotQC(spe_cohort1, plot_type = "spot", annotate = "log_is_outlier_mad") +
+  facet_wrap(~spe_cohort1$sample_id)
+
+#ggsave("plots/20250204_spotexclusion_logmito_samplespecific_upperoutliers.png")
+
+```
+
+```{r}
+# Combine the non-log and log sample statistics by matching on 'sample_id'
+
+
+combined_stats_arbitrary <- as.data.frame(colData(spe_cohort2)) %>%
+  group_by(sample_id) %>%
+  summarise(
+    # Arbitrary threshold of 20% mitochondrial content
+    mito_outlier_arbitrary_spots = sum(subsets_Mito_percent > 20, na.rm = TRUE),  # Spots with >20% mito
+    mito_outlier_arbitrary_percentage = (mito_outlier_arbitrary_spots / n()) * 100,  # Proportion of outliers
+    mito_outlier_arbitrary_threshold = 20  # Threshold for arbitrary outlier definition
+
+    # For non-log transformed data (MAD method)
+   # mad_outlier_spots = sum(is_outlier_mad == TRUE, na.rm = TRUE),  # Number of spots flagged as outliers for MAD
+  #  mad_outlier_percentage = (mad_outlier_spots / n()) * 100,  # Percentage of outliers for MAD
+  #  mad_outlier_threshold = median(subsets_Mito_percent, na.rm = TRUE) + 3 * mad(subsets_Mito_percent, na.rm = TRUE),  # MAD threshold for each sample
+
+    # For log-transformed data (MAD method)
+   # log_mad_outlier_spots = sum(log_is_outlier_mad == TRUE, na.rm = TRUE),  # Number of log-transformed outliers
+    #log_mad_outlier_percentage = (log_mad_outlier_spots / n()) * 100,  # Percentage of log-transformed outliers
+    #log_mad_outlier_threshold = median(log_mito_percent, na.rm = TRUE) + 3 * mad(log_mito_percent, na.rm = TRUE)  # MAD threshold for log-transformed data
+  )
+
+# View the result
+print(combined_stats_arbitrary)
+
+
+combined_stats_log <- as.data.frame(colData(spe_cohort1)) %>%
+  group_by(sample_id) %>%
+  summarise(
+    # Arbitrary threshold of 20% mitochondrial content
+   # mito_outlier_arbitrary_spots = sum(subsets_Mito_percent > 20, na.rm = TRUE),  # Spots with >20% mito
+   # mito_outlier_arbitrary_percentage = (mito_outlier_arbitrary_spots / n()) * 100,  # Proportion of outliers
+   # mito_outlier_arbitrary_threshold = 20,  # Threshold for arbitrary outlier definition
+
+    # For non-log transformed data (MAD method)
+    mad_outlier_spots = sum(is_outlier_mad == TRUE, na.rm = TRUE),  # Number of spots flagged as outliers for MAD
+    mad_outlier_percentage = (mad_outlier_spots / n()) * 100,  # Percentage of outliers for MAD
+    mad_outlier_threshold = median(subsets_Mito_percent, na.rm = TRUE) + 3 * mad(subsets_Mito_percent, na.rm = TRUE),  # MAD threshold for each sample
+
+    # For log-transformed data (MAD method)
+    log_mad_outlier_spots = sum(log_is_outlier_mad == TRUE, na.rm = TRUE),  # Number of log-transformed outliers
+    log_mad_outlier_percentage = (log_mad_outlier_spots / n()) * 100,  # Percentage of log-transformed outliers
+    log_mad_outlier_threshold = median(log_mito_percent, na.rm = TRUE) + 3 * mad(log_mito_percent, na.rm = TRUE)  # MAD threshold for log-transformed data
+  )
+
+# View the result
+print(combined_stats_log)
+
+```
+
+
+
+```{r filter summary arbitrary mito }
+#sets up logical vector for final filterin, filtered will be TRUE for any spot where either qc_lib_size is TRUE or qc_genes_detected is TRUE (or both).
+filtered_arb <- qc_lib_size2 | qc_genes_detected2 | qc_mito  
+colData(spe_cohort2)$filtered <- qc_lib_size2 | qc_genes_detected2 | qc_mito
+# this makes a table of the final filtering (remember to chage this code where indicated to the filters you want)
+filter_summary <- tibble(
+  Group = spe_cohort2$sample_id,
+  `Number of spots` = 1,
+  `Library size filter` = qc_lib_size2, # here
+  `Genes detected filter` = qc_genes_detected2, # here
+  `Mitochondrial filter` = qc_mito, # here
+  `Filtered spots` = filtered_arb,
+  `Retained spots` = !filtered_arb
+) %>%
+  mutate(Group = spe_cohort2$sample_id) %>%
+  group_by(Group) %>%
+  summarize_all(sum)
+
+filter_summary %>%
+  datatable(rownames = FALSE, options = list(dom = 't'))
+```
+
+```{r log mito cohort 1}
+#sets up logical vector for final filterin, filtered will be TRUE for any spot where either qc_lib_size is TRUE or qc_genes_detected is TRUE (or both).
+filtered_log <- qc_lib_size1 | qc_genes_detected1 | log_is_outlier_mad    
+colData(spe_cohort1)$filtered <- qc_lib_size1 | qc_genes_detected1 | log_is_outlier_mad
+# this makes a table of the final filtering (remember to chage this code where indicated to the filters you want)
+filter_summary <- tibble(
+  Group = spe_cohort1$sample_id,
+  `Number of spots` = 1,
+  `Library size filter` = qc_lib_size1, # here
+  `Genes detected filter` = qc_genes_detected1, # here
+  `Mitochondrial filter` = log_is_outlier_mad, # here
+  `Filtered spots` = filtered_log,
+  `Retained spots` = !filtered_log
+) %>%
+  mutate(Group = spe_cohort1$sample_id) %>%
+  group_by(Group) %>%
+  summarize_all(sum)
+
+filter_summary %>%
+  datatable(rownames = FALSE, options = list(dom = 't'))
+```
+
+
+```{r plot all lost}
+
+# plots your final decisions
+plotSpotQC(spe_cohort1, plot_type = "spot", 
+       annotate = "filtered") + facet_wrap(~spe_cohort1$sample_id)
+
+# plots your final decisions
+plotSpotQC(spe_cohort2, plot_type = "spot", 
+       annotate = "filtered") + facet_wrap(~spe_cohort2$sample_id)
+```
+
+```{r actual filter}
+
+#actually does the filtering and makes a new object (keep the old one so you can go back if needed)
+spe_filt1  <- spe_cohort1[, !filtered_log]
+coldata1 <- colData(spe_filt1) %>% as.data.frame() %>% colnames()
+
+colData(spe_filt1)$qc_lib_size <- colData(spe_filt1)$qc_lib_size1
+colData(spe_filt1)$qc_genes_detected <- colData(spe_filt1)$qc_genes_detected1
+colData(spe_filt1)$qc_mito <- colData(spe_filt1)$log_is_outlier_mad
+colData(spe_filt1) <- colData(spe_filt1)[ , !(colnames(colData(spe_filt1)) %in% c("qc_genes_detected1","qc_lib_size1","median_mito_percent","mad_mito_percent","deviation_from_median","is_outlier_mad"           , "log_mito_percent","log_median_mito_percent","log_mad_mito_percent","log_deviation_above_median","log_is_outlier_mad"))]
+
+#actually does the filtering and makes a new object (keep the old one so you can go back if needed)
+spe_filt2  <- spe_cohort2[, !filtered_arb]
+coldata2 <- colData(spe_filt2) %>% as.data.frame() %>%  colnames()
+
+colData(spe_filt2)$qc_lib_size <- colData(spe_filt2)$qc_lib_size2
+colData(spe_filt2)$qc_genes_detected <- colData(spe_filt2)$qc_genes_detected2
+
+colData(spe_filt2) <- colData(spe_filt2)[ , !(colnames(colData(spe_filt2)) %in% c("qc_genes_detected2","qc_lib_size2"))]
+
+
+spe_filt <- cbind(spe_filt1, spe_filt2)
+```
+
+```{r}
+# here I'm trying to look for genes that aren't 'really' detected, basically so low they aren't useful
+number_of_spots_in_which_gene_detected <- rowSums(counts(spe_filt) != 0)
+
+
+tibble(nspots = number_of_spots_in_which_gene_detected) %>%
+  ggplot(aes(x = nspots)) +
+  geom_histogram(bins = 50, fill = "grey80", colour = "black") +
+  labs(x = "Number of spots in which a gene is detected", y = "Frequency") +
+  theme_bw()
+```
+
+```{r gene filter}
+# I normally have this at 5 unless i'm dealing with a huge dataset
+genes_detected_in_too_few_spots <- number_of_spots_in_which_gene_detected < 5
+spe_filt <- spe_filt[!genes_detected_in_too_few_spots, ]
+
+```
+
+```{r save}
+# I save a version of the cleaned data for taking forward into the analysis (normally a separate script)
+saveRDS(spe_filt, "20250204_post_genefilter_QC_arbitrary_and_log_mito.rds")
+
+spe_filt <- read_rds("20250226_post_genefilter_QC_arbitrary_and_log_mito.rds")
+```
+
+```{r separate out the spe to model the gene-variance relationship separately, eval=FALSE}
+#library(DelayedArray)
+#spe_filt<- read_rds("20241217_post_QC_nomitofilter.rds")
+
+spe_subset <- list() # initialise a list to store individual samples
+
+for (sample_id in samplesheet) {
+  spe_subset[[sample_id]] <-  spe_filt[, colData(spe_filt)$sample_id==sample_id]
+}
+
+
+```
+After filtering - `r nrow(spe_filt)` genes, `r ncol(spe_filt)` spots
+
+##Normalisation: Calculate logcounts using library size factors from scater (McCarthy et al. 2017) and scran (Lun, McCarthy, and Marioni 2016) packages, which were originally developed for scRNA-seq data, making the assumption here that these methods can be applied to SRT data by treating spots as equivalent to cells.
+
+We use the library size factors methodology since this is the simplest approach, and can easily be applied to SRT data. Alternative approaches eg deconvolution, are more difficulty to justify in the context of spot-based SRT data since (i) spots may contain multiple cells from more than one cell type, and (ii) datasets can contain multiple samples (e.g. multiple Visium slides, resulting in sample-specific clustering).
+
+For each cell, raw counts for genes are divided by the size factor for that cell and log-transformed so downstream analyses focus on genes with strong relative differences. We use scater::logNormCounts()
+```{r if processing in single spe}
+#omit if loading multiple samples into spe
+#calculate library size factors
+
+spe_filt <- computeLibraryFactors(spe_filt)
+
+saveRDS(spe_filt, "20250226_post_computelibfactors_arbitrary_and_log_mito.rds")
+
+spe_filt <- readRDS("20250226_post_computelibfactors_arbitrary_and_log_mito.rds")
+
+summary(sizeFactors(spe_filt))
+hist(sizeFactors(spe_filt), breaks = 20)
+
+#may want to open interactive node session to run this, in terminal connect to cluster then enter
+#srun --pty --job-name=interactive_r --mem=32G --cpus-per-task=4 --partition=epyc --time=02:00:00 bash 
+#then open R
+
+#may have to run on scratcha as you need all the other files in visium_data which aren't on scratchc
+##srun --pty --job-name=interactive_r --mem=32G --cpus-per-task=4 --partition=general --time=02:00:00 bash 
+```
+
+```{r if processing in list}
+#run computeLibraryFactors individually as it tends to crash R when running on multiple samples 
+spe_subset <- lapply(spe_subset, function(x) {
+  message("Computing library factors for ", x$sample_id[1])
+  computeLibraryFactors(x, BPPARAM = bpp)
+})
+lapply(spe_subset, function(x) summary(sizeFactors(x)))
+
+```
+
+
+```{r}
+
+
+# calculate logcounts and store in object
+spe_filt <- lapply(spe_filt, function(x) logNormCounts(x, BPPARAM = bpp))
+  
+spe_filt <- logNormCounts(spe_filt, BPPARAM=bpp)
+
+# check
+assayNames(spe_filt)
+
+spe_filt$barcode <- colnames(spe_filt)
+```
+
+
+```{r visualise before and after normalisation}
+oneSamTab <- colData(spe_filt) %>% 
+  as.data.frame() %>% 
+  #dplyr::filter(sample_id == "sample01") %>% 
+  dplyr::select(sample_id,barcode, sum) %>% 
+  dplyr::mutate(cell_num = 1:n())
+
+p_before_norm <- ggplot(data=oneSamTab, aes(x=cell_num, y=sum)) +
+  geom_bar(stat = 'identity') +
+  labs( x= 'Cell Index',
+        y='Spot UMI counts',
+        title = "Before Normalization" ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size=15)
+  )
+
+
+
+norm_counts <- logNormCounts(spe_filt,transform='none' ) %>% 
+  assay('normcounts') %>% 
+  as.matrix() %>% 
+  colSums()
+norm_counts <- tibble(barcode=names(norm_counts),
+                      normCounts = log2(norm_counts)
+                      )
+norm_counts <- inner_join(norm_counts, oneSamTab, by='barcode')
+
+
+p_after_norm <- ggplot(data=norm_counts, aes(x=cell_num, y=normCounts)) +
+  geom_bar(stat = 'identity') +
+  labs( x= 'Cell Index',
+        y='Normalized Spot UMI counts',
+        title = "sample01:After Normalization" ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size=20, color = 'red')
+  )
+
+p_before_norm 
+p_after_norm
+
+ ggsave("20250226_umi_beforenormalisation.png", plot=p_before_norm, width= 8, height = 6, units = "in")
+  ggsave("20250226_umi_afternormalisation.png", plot=p_after_norm, width= 8, height = 6, units = "in")
+```
+##HVGs
+##We use methods from scran (Lun, McCarthy, and Marioni 2016) to identify a set of top highly variable genes (HVGs), which can be used to define major cell types.
+
+Assuming that, for most genes, the observed variance across cells is due to technical noise, we can assess technical variation by fitting a trend line between the mean-variance relationship across all genes. Genes that substantially deviate from this trend = highly-variable, i.e. capturing biologically interesting variation. The scran function modelGeneVar models the mean-variance relationship, estimates total variance along with what it considers is the biological and technical variance.
+
+To identify HVGs, we first remove mitochondrial genes, since these are very highly expressed in this dataset and are not of main biological interest.
+```{r feature selection}
+
+#spe_filt <- read_rds("20241219_post_logNormCounts.rds")
+# remove mitochondrial genes
+#is_mito_filt <- grepl("(^MT-)|(^mt-)", rowData(spe_filt)$symbol)
+#table(is_mito_filt)
+#spe_filt <- spe_filt[!is_mito_filt, ]
+#dim(spe_filt)
+```
+
+We apply methods from scran. Fitting the gene-variance relationship allows us to find those with the greatest variance
+getTopHGVs then gives us a list of HVGs, which can be used for further downstream analyses. 
+The parameter prop defines how many HVGs we want. For example prop = 0.1 returns the top 10% of genes.
+```{r model gene variance relationship}
+# fit mean-variance relationship
+dec <- modelGeneVar(spe_filt) #dec contains per-gene variance statistics
+dec <- read_rds("/mnt/fmlab/group_folders/lythgo02/Spatial/20250226_dec_arbitrary_and_log_mito.rds")
+
+spe_filt <- read_rds("/mnt/fmlab/group_folders/lythgo02/Spatial/20250226_post_modelgenevar_arb_and_log.rds")
+# visualize mean-variance relationship
+fit <- metadata(dec)  #retrieves fitted trend line parameters
+
+#plot variance vs mean for each gene and visualise limit of technical variance according to fitted trend line
+#each point/feature = a gene
+#features below the line = technical noise
+#Genes above the curve have higher-than-expected variance and may be biologically relevant
+plot(fit$mean, fit$var, 
+     xlab = "mean of log-expression", ylab = "variance of log-expression") 
+curve(fit$trend(x), col = "dodgerblue", add = TRUE, lwd = 2)
+```
+
+
+```{r}
+# select top HVGs to use in downstream analyses (eg PCA)
+top_hvgs <- getTopHVGs(dec, prop = 0.1)
+length(top_hvgs)
+
+#visualise expression of top most variable genes with violin plot for each gene
+
+plotExpression(spe_filt, features = top_hvgs[1:20], point_alpha = 0.05)
+```
+Note that HVGs are defined based only on molecular features (i.e. gene expression), and do not take any spatial information into account. 
+If the biologically meaningful spatial information mainly reflects spatial distributions of cell types, then relying on HVGs for downstream analyses may be sufficient. However, many datasets contain further spatial structure that is not captured in this way, which may be investigated using spatially-aware methods such as identifying spatially variable genes (SVGs).
+Here, we define SVGs as any genes with spatially correlated patterns of expression across the tissue area.
+
+Several methods to identify SVGs in ST data have recently been developed:
+nnSVG: available as an R package from Bioconductor and described by Weber et al. (2023)
+SPARK-X: available as an R package from GitHub and described by Zhu, Sun, and Zhou (2021)
+SPARK: available as an R package from GitHub and described by Sun, Zhu, and Zhou (2020)
+SpatialDE: available as a Python package from GitHub and described by Svensson, Teichmann, and Stegle (2018)
+
+Step 1: Run nnSVG on spatial transcriptomics data to identify spatially variable genes.
+Step 2: After identifying these genes, integrate and align image data to:
+Visualize gene expression patterns overlaid on histology/IF images.
+Perform image-based segmentation or annotation to analyze gene expression in specific regions.
+```{r}
+#devtools::install_github("https://github.com/lmweber/nnSVG")
+
+library(nnSVG)
+
+# run nnSVG
+set.seed(123)
+#spe_nnSVG <- nnSVG(spe_filt) #i run this on the cluster via nnsvg_logbatch.r or nnsvg_arbitrary.r instead
+spe_filt<- readRDS("/run/user/1804238067/gvfs/sftp:host=clust1-sub-1/mnt/scratchc/fmlab/lythgo02/visium_data/arbitrary/nnsvg_1stattempt/nnsvgprocessed_SITSA1.rds")
+
+rowData(spe_filt) #results stored in rowdata
+
+```
+
+The results are stored in the rowData of the SpatialExperiment object.
+The main results of interest are:
+LR_stat: likelihood ratio (LR) statistics used to rank SVGs
+rank: rank of top SVGs according to LR statistics
+pval: approximate p-values
+padj: approximate p-values adjusted for multiple testing
+prop_sv: effect size defined as proportion of spatial variance
+```{r, Investigate results}
+# number of significant SVGs
+table(rowData(spe_filt)$padj <= 0.05)
+## 
+
+#show results for top 10 SVGs
+
+test <- rowData(spe_filt)[order(rowData(spe_filt)$rank)[1:500], ] %>% 
+  as.data.frame()
+
+# plot spatial expression of top-ranked SVG
+ix <- which(rowData(spe_filt)$rank == 1)
+ix_name <- rowData(spe_filt)$symbol[ix]
+ix_name
+```
+
+
+```{r}
+df <- as.data.frame(cbind(spatialCoords(spe_filt), expr = counts(spe_filt)[ix, ]))
+
+df <- as.data.frame(cbind(
+  spatialCoords(spe_filt), 
+  expr = as.vector(as.matrix(counts(spe_filt))[ix, ])
+))
+ggplot(df, aes(x = pxl_col_in_fullres, y = pxl_row_in_fullres, 
+               color = expr)) + 
+  geom_point(size = 0.8) + 
+  coord_fixed() + 
+  scale_y_reverse() + 
+  scale_color_gradient(low = "gray90", high = "blue", 
+                       trans = "sqrt", breaks = range(df$expr), 
+                       name = "counts") + 
+  ggtitle(ix_name) + 
+  theme_bw() + 
+  theme(plot.title = element_text(face = "italic"), 
+        panel.grid = element_blank(), 
+        axis.title = element_blank(), 
+        axis.text = element_blank(), 
+        axis.ticks = element_blank())
+
+#ggsave("plots/20250214_nnsvg.png")
+```
+
+```{r make function to retrieve top SVGs}
+
+
+getTopSVGs <- function(spatial_experiment, n = NULL, padj.threshold = NULL, sort.by = "rank") {
+  # Extract rowdata containing nnsvg results as a dataframe
+  results <- as.data.frame(rowData(spatial_experiment))
+  # If user specifies a p-value threshold, filter the results by the value given
+  if (!is.null(padj.threshold)) {
+    results <- results %>% filter(padj <= padj.threshold)
+  }
+  
+  # Sort by the specified column, either descending or ascending
+  results <- results %>%
+    arrange(
+      case_when(
+        sort.by == "LR_stat" | sort.by == "prop_sv" ~ desc(.data[[sort.by]]), # Sort in descending order for LR_stat or prop_sv
+        sort.by == "rank" ~ .data[[sort.by]],  # Sort in ascending order for rank
+        TRUE ~ .data[[sort.by]]  # Default case (if another column is specified)
+      )
+    )
+  
+  # Return top N rows if specified, otherwise return all
+  if (!is.null(n)) {
+    results <- head(results, n)
+  }
+  
+  return(results)
+}
+
+    
+```
+
+```{r}
+top_svgs <- getTopSVGs(spe_filt, padj.threshold =0.05, sort.by="rank")
+```
+
+#various options from here:
+#convert to zar object and use spatialdata to align images (20250214_python_sptial.py)
+#continue in  with https://bookdown.org/sjcockell/ismb-tutorial-2023/practical-session-3.html#neighbour-graph-and-distance-matrix
+for clustering (with histo classifiers as priors) etc (see spatial_workflow doc)
+
+Integrating HVGs and SVGs
+A recent benchmark paper (Li et al. 2022) showed that integrating HVGs and SVGs to generate a combined set of features can improve downstream clustering performance in STx data. This confirms that SVGs contain additional biologically relevant information that is not captured by HVGs in these datasets. For example, a simple way to combine these features is to concatenate columns of principal components (PCs) calculated on the set of HVGs and the set of SVGs (excluding overlapping HVGs), and then using the combined set of features for further downstream analyses (Li et al. 2022).
+
+
+Dimensionality reduction
+DR reduces noise from random variation and improves computational efficiency. We have X amount of spots, each with as many dimensions as the number of variable genes you are taking forward. Avoid curse of dimensionality by reducing features. 
+
+3 methods: 
+Principal Components Analysis (PCA) MAP uses linear transformation of the data so the distances between data points in a PCA space are interpretable and can be used for clustering. PCA defines new dimensions (axes) capturing most if the variance.
+Uniform Manifold Approximation and Projection (U(McInnes, Healy, and Melville 2018) and t-Stochastic Neighbor Embedding (tSNE) (Maaten and Hinton 2008) do not assume linearity and provide some performance advantages. t-SNE and UMAP = non-linear methods of dimensionality reduction which cluster spots on similarity but distances in a UMAP/tSNE embedding are not interpretable.
+
+Use PCA to reduce the dimensions of our dataset to assist clustering and UMAP to further reduce the principal components (PCs) in a two-dimensional space and produce better visualisations for the PCA.
+
+runPCA() function runs PCA on a SCE object, and returns an updated version of the single cell object with the PCA result added to the reducedDim slot.
+
+```{r dimensionality reduction PCA HVGs}
+# Compute PCA for HVGs (highly variable genes)
+set.seed(123)
+spe_filt <- runPCA(spe_filt, subset_row = top_hvgs)  # Restrict PCA to use only HVGs
+# Store the PCA result for HVGs in the "PCA_HVGs" slot
+reducedDim(spe_filt, "PCA_HVGs") <- reducedDim(spe_filt, "PCA")
+# Optional: Check the results
+reducedDimNames(spe_filt)
+
+# Compute PCA for SVGs (spatially variable genes)
+set.seed(123)
+spe_filt <- runPCA(spe_filt, subset_row = top_svgs)  # Restrict PCA to use only SVGs
+# Store the PCA result for SVGs in the "PCA_SVGs" slot
+reducedDim(spe_filt, "PCA_SVGs") <- reducedDim(spe_filt, "PCA")
+# Optional: Check the results
+reducedDimNames(spe_filt)
+```
+
+```{r plot PCAs}
+# View the dimensions of the reduced dimensions for both PCA analyses
+dim(reducedDim(spe_filt, "PCA_HVGs"))
+dim(reducedDim(spe_filt, "PCA_SVGs"))
+
+# View the variance explained for both PCA analyses
+percent.var.hvgs <- attr(reducedDim(spe_filt, "PCA_HVGs"), "percentVar")
+percent.var.svgs <- attr(reducedDim(spe_filt, "PCA_SVGs"), "percentVar")
+
+# Plot variance explained for HVGs
+plot(percent.var.hvgs, log = "y", xlab = "PC", ylab = "Variance explained (%)")
+abline(v = PCAtools::findElbowPoint(percent.var.hvgs), col = "dodgerblue")
+
+# Plot variance explained for SVGs
+plot(percent.var.svgs, log = "y", xlab = "PC", ylab = "Variance explained (%)")
+abline(v = PCAtools::findElbowPoint(percent.var.svgs), col = "dodgerblue")
+
+```
+
+```{r integrate VGs }
+#integrate SVGs and HVGs
+
+# Extract the PCs for both HVGs and SVGs
+pca_hvgs <- reducedDim(spe_filt, "PCA_HVGs")
+pca_svgs <- reducedDim(spe_filt, "PCA_SVGs")
+
+# Concatenate the principal components (PCs)
+combined_pcs <- cbind(pca_hvgs, pca_svgs) #figure out what to do for overlapping ones 
+
+# Store the concatenated PCs in the 'spe_filt' object
+reducedDim(spe_filt, "PCA_combined") <- combined_pcs
+
+# Optional: Check the result
+dim(reducedDim(spe_filt, "PCA_combined"))
+```
+
+#Run UMAP on the set of top 50 PCs and retain top 2 UMAP components for visualization 
+```{r dim reduction UMAP}
+
+# compute UMAP on top 50 PCs
+set.seed(123)
+spe_filt <- runUMAP(spe_filt, dimred = "PCA")
+
+reducedDimNames(spe_filt)
+dim(reducedDim(spe_filt, "UMAP"))
+
+# update column names for easier plotting
+colnames(reducedDim(spe_filt, "UMAP")) <- paste0("UMAP", 1:2)
+
+# plot top 2 PCA dimensions
+plotDimRed(spe_filt, type = "PCA")
+
+```
+```{r}
+# plot top 2 UMAP dimensions
+plotDimRed(spe_filt, type = "UMAP")
+```
+
+https://bioinformatics-core-shared-training.github.io/SingleCell_RNASeq_Jan24/UnivCambridge_ScRnaSeqIntro_Base/Markdowns/07_Dataset_Integration.html
+
+```{r batch correction}
+
+```
+
+
+Cluster gene expression via scRNAseq methods
+Graph-based clustering using the Walktrap method implemented in scran (Lun, McCarthy, and Marioni 2016), applied to the top 50 PCs calculated on the set of top HVGs.Assume that biologically informative spatial distribution patterns of cell types can be detected from the molecular features (gene expression).
+```{r clustering to identify spatial domains}
+# graph-based clustering
+set.seed(123)
+k <- 10
+g <- buildSNNGraph(spe_filt, k = k, use.dimred = "PCA")
+g_walk <- igraph::cluster_walktrap(g)
+clus <- g_walk$membership
+table(clus)
+
+# store cluster labels in column 'label' in colData
+colLabels(spe_filt) <- factor(clus)
+```
+
+```{r}
+# plot clusters in spatial x-y coordinates
+# Example of dynamically assigning colors based on the number of spots
+# Example of a color palette generator
+my_palette <- my_palette <- rainbow(37)
+
+
+spots <- plotSpots(spe_filt, annotate = "label",
+          palette = my_palette)
+
+spots
+```
+```{r}
+# plot clusters in PCA reduced dimensions
+pca <- plotDimRed(spe_filt, type = "PCA", 
+           annotate = "label", palette = my_palette)
+
+pca
+```
+```{r}
+# plot clusters in UMAP reduced dimensions
+umap <- plotDimRed(spe_filt, type = "UMAP", 
+           annotate = "label", palette = my_palette)
+
+umap
+```
+
+```{r}
+# set gene names as row names for easier plotting
+rownames(spe_filt) <- rowData(spe_filt)$symbol
+
+# test for marker genes
+markers <- findMarkers(spe_filt, test = "binom", direction = "up")
+
+# returns a list with one DataFrame per cluster
+markers
+```
+
+```{r}
+# plot log-fold changes for one cluster over all other clusters
+# selecting cluster 1
+interesting <- markers[[1]]
+best_set <- interesting[interesting$Top <= 5, ]
+logFCs <- getMarkerEffects(best_set)
+
+pheatmap::pheatmap(logFCs, breaks = seq(-5, 5, length.out = 101))
+
+
+```
+
+
+Both the SpatialImage (SpI) and SpatialExperiment (SpE) class currently support two basic image transformations, namely, rotation (via rotateImg()) and mirroring (via mirrorImg()). Specifically, for a SpI/E x:
+
+rotateImg(x, degrees) expects as degrees a single numeric in +/-[0,90,…,360].
+Here, a (negative) positive value corresponds to (counter-)clockwise rotation.
+mirrorImg(x, axis) expects as axis a character string specifying
+whether to mirror horizontally ("h") or vertically ("v").
+see https://www.bioconductor.org/packages/release/bioc/vignettes/SpatialExperiment/inst/doc/SpatialExperiment.html
+
+

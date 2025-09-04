@@ -1,0 +1,392 @@
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(DropletUtils)
+library(scran)
+library(SpatialExperiment) #in terminal: sudo Rscript -e 'if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager", repos =                     "https://cran.rstudio.com"); BiocManager::install("SpatialExperiment")'
+                                  #if this fails due to magick, first run:  sudo apt-get update
+                                                                   # then: sudo apt-get install libmagick++-dev
+                                                                   # then sudo R to open R session and install.packages("magick")     
+
+
+projDir = "/mnt/fmlab/group_folders/lythgo02/Spatial/"
+```
+
+## after processing in 20240206 QC final workflow
+#wont work if loading from scratch 
+```{r}
+
+
+ load_all_data <- "/run/user/1804238067/gvfs/sftp:host=clust1-sub-2,user=lythgo02/scratchc/fmlab/lythgo02/visium_data/logbatch/nnsvg"
+# List files in the directory
+files <- list.files(path = load_all_data, pattern = "^nnsvg", full.names = TRUE)
+
+# Print out the list of files
+print(files)
+
+#assign names so they are loaded into the spe with the correct identifiers
+logbatch <- c("SITSA3", "SITSB2", "SITSB4", 
+                 "SITSC1","SITSC3","SITSD3",
+                 "SITSE4","SITSF2", "SITSF4")
+
+names(files) <- logbatch
+# Initialize a list to store each sample
+spe_list <- list()
+
+# Loop through each file and process it
+for (sample_name in names(files)) {
+  # Read the Visium data
+  spe <- readRDS(files[sample_name])
+    # Add unique barcodes
+  spe$barcode <- rownames(colData(spe))
+  spe$barcodeid <- gsub("-1$", paste0("-", sample_name), spe$barcode)
+  rownames(colData(spe)) <- spe$barcodeid
+  spe$sample_id <- sample_name
+
+  # Store the processed sample in the list
+  spe_list[[sample_name]] <- spe 
+  
+  
+  assign(paste0("spe_", sample_name), spe)
+  #print progress check
+  cat("Loaded:", sample_name, "\n")
+}
+
+```
+
+
+## after processing in 20240206 QC final workflow
+```{r}
+ load_all_data <- "/run/user/1804238067/gvfs/sftp:host=clust1-sub-2,user=lythgo02/scratchc/fmlab/lythgo02/visium_data/arbitrary/nnsvg"
+# List files in the directory
+files <- list.files(path = load_all_data, pattern = "^nnsvg", full.names = TRUE)
+
+# Print out the list of files
+print(files)
+
+#assign names so they are loaded into the spe with the correct identifiers
+arbitrary <- c("SITSA1","SITSA2","SITSA4", "SITSB1", "SITSB3", 
+                 "SITSC2","SITSC4","SITSD1","SITSD2", "SITSD4",
+                 "SITSE2","SITSG2", "SITSH2")
+
+names(files) <- arbitrary 
+
+# Loop through each file and process it
+for (sample_name in names(files)) {
+ # Read the Visium data
+  spe <- readRDS(files[sample_name])
+    # Add unique barcodes
+  #spe$barcode <- rownames(colData(spe))
+ # spe$barcodeid <- gsub("-1$", paste0("-", sample_name), spe$barcode)
+  #rownames(colData(spe)) <- spe$barcodeid
+  #spe$sample_id <- sample_name
+  
+  # Store the processed sample in the list
+  spe_list[[sample_name]] <- spe 
+  
+  
+  assign(paste0("spe_", sample_name), spe)
+  #print progress check
+  cat("Loaded:", sample_name, "\n")
+}
+
+samplesheet <- cat(logbatch, arbitrary)
+
+
+```
+
+```{r}
+#spe <- SEtools::mergeSEs(spe_list,commonOnly=FALSE, do.scale=FALSE) # cant' bind here because using objects prcoessed in scratch space
+
+gene_count <- lapply(spe_list, function(x) table(rowData(x)$symbol))
+
+gene_count_table <- do.call(cbind, gene_count) %>% as.data.frame() %>% 
+  mutate(sum = rowSums(.)) %>% 
+  filter(sum >22 | 
+           sum < 22)
+
+
+```
+```{r}
+# Step 1: Extract unique sample IDs from colData(spe)
+sample_ids <- unique(colData(spe)$sample_id)
+
+# Step 2: Initialize a list to store subsets and plots
+spe_subset <- list()
+plot_spots <- list()
+
+# Step 3: Loop through each sample and generate plots
+for (sample_id in sample_ids) {
+  # Subset spe by sample_id
+  spe_subset[[sample_id]] <- spe[, colData(spe)$sample_id == sample_id]
+  
+  # Generate and store the plot for this sample
+  plot_spots[[sample_id]] <- plotSpots(spe_subset[[sample_id]])
+}
+
+# Step 4: Display the plots in a grid
+# Example: Display the first 11 plots in a 2x4 grid
+gridExtra::grid.arrange(grobs = plot_spots[1:11], ncol = 4)
+
+# Example: Display plots from 12 to 22 in a 2x4 grid
+gridExtra::grid.arrange(grobs = plot_spots[12:22], ncol = 4)
+
+# Step 5: Faceting by sample_id
+spots <- plotSpots(spe) +
+  facet_wrap(~colData(spe)$sample_id)
+print(spots)
+
+```
+```{r}
+spe_afternnsvg<- readRDS("/run/user/1804238067/gvfs/sftp:host=clust1-sub-2,user=lythgo02/scratchc/fmlab/lythgo02/visium_data/logbatch/nnsvg/nnsvgprocessed_SITSA3.rds")
+
+dec <- readRDS("/run/user/1804238067/gvfs/sftp:host=clust1-sub-2,user=lythgo02/scratchc/fmlab/lythgo02/visium_data/logbatch/decSITSA3.rds")
+```
+
+
+
+```{r feature selection}
+
+#spe_filt <- read_rds("20241219_post_logNormCounts.rds")
+# remove mitochondrial genes
+#is_mito_filt <- grepl("(^MT-)|(^mt-)", rowData(spe_filt)$symbol)
+#table(is_mito_filt)
+#spe_filt <- spe_filt[!is_mito_filt, ]
+#dim(spe_filt)
+```
+
+
+```{r}
+readRDS("20250226_dec_arbitrary_and_log_mito.rds")
+
+saveRDS(spe_filt, "20250226_post_modelgenevar_arb_and_log.rds")
+```
+
+```{r}
+# select top HVGs to use in downstream analyses (eg PCA)
+top_hvgs <- getTopHVGs(dec, prop = 0.1)
+length(top_hvgs)
+
+#visualise expression of top most variable genes with violin plot for each gene
+
+plotExpression(spe_afternnsvg, features = top_hvgs[1:20], point_alpha = 0.05)
+```
+Note that HVGs are defined based only on molecular features (i.e. gene expression), and do not take any spatial information into account. 
+If the biologically meaningful spatial information in this dataset mainly reflects spatial distributions of cell types, then relying on HVGs for downstream analyses may be sufficient. However, many datasets contain further spatial structure that is not captured in this way, which may be investigated using spatially-aware methods such as identifying spatially variable genes (SVGs).
+
+Alternatively, we can apply methods to identify spatially variable genes (SVGs) instead of HVGs 
+Here, we define SVGs as any genes with spatially correlated patterns of expression across the tissue area.
+
+Several methods to identify SVGs in ST data have recently been developed:
+
+nnSVG: available as an R package from Bioconductor and described by Weber et al. (2023)
+
+SPARK-X: available as an R package from GitHub and described by Zhu, Sun, and Zhou (2021)
+
+SPARK: available as an R package from GitHub and described by Sun, Zhu, and Zhou (2020)
+
+SpatialDE: available as a Python package from GitHub and described by Svensson, Teichmann, and Stegle (2018)
+
+Step 1: Run nnSVG on spatial transcriptomics data to identify spatially variable genes.
+Step 2: After identifying these genes, integrate and align image data to:
+Visualize gene expression patterns overlaid on histology/IF images.
+Perform image-based segmentation or annotation to analyze gene expression in specific regions.
+```{r}
+#devtools::install_github("https://github.com/lmweber/nnSVG")
+
+library(nnSVG)
+
+# run nnSVG
+set.seed(123)
+#spe_nnSVG <- nnSVG(spe_filt) #i run this on the cluster via nnsvg_logbatch.r or nnsvg_arbitrary.r instead
+spe_nnSVG<- read_rds(file = "/run/user/1804238067/gvfs/sftp:host=clust1-sub-2,user=lythgo02/scratchc/fmlab/lythgo02/visium_data/bulkprocess_until_nnsvg/nnsvg/20250227_spe_SITSA2.rds")
+# show results
+rowData(spe_nnSVG) #results stored in rowdata
+
+```
+
+The results are stored in the rowData of the SpatialExperiment object.
+The main results of interest are:
+LR_stat: likelihood ratio (LR) statistics used to rank SVGs
+rank: rank of top SVGs according to LR statistics
+pval: approximate p-values
+padj: approximate p-values adjusted for multiple testing
+prop_sv: effect size defined as proportion of spatial variance
+```{r, Investigate results}
+# number of significant SVGs
+table(rowData(spe_nnSVG)$padj <= 0.05)
+## 
+
+#show results for top 10 SVGs
+
+test <- rowData(spe_nnSVG)[order(rowData(spe_nnSVG)$rank)[1:500], ] %>% 
+  as.data.frame()
+
+# plot spatial expression of top-ranked SVG
+ix <- which(rowData(spe_nnSVG)$rank == 1)
+ix_name <- rowData(spe_nnSVG)$symbol[ix]
+ix_name
+```
+```{r}
+df <- as.data.frame(cbind(spatialCoords(spe_nnSVG), expr = counts(spe_nnSVG)[ix, ]))
+
+df <- as.data.frame(cbind(
+  spatialCoords(spe_nnSVG), 
+  expr = as.vector(as.matrix(counts(spe_nnSVG))[ix, ])
+))
+ggplot(df, aes(x = pxl_col_in_fullres, y = pxl_row_in_fullres, 
+               color = expr)) + 
+  geom_point(size = 0.8) + 
+  coord_fixed() + 
+  scale_y_reverse() + 
+  scale_color_gradient(low = "gray90", high = "blue", 
+                       trans = "sqrt", breaks = range(df$expr), 
+                       name = "counts") + 
+  ggtitle(ix_name) + 
+  theme_bw() + 
+  theme(plot.title = element_text(face = "italic"), 
+        panel.grid = element_blank(), 
+        axis.title = element_blank(), 
+        axis.text = element_blank(), 
+        axis.ticks = element_blank())
+
+#ggsave("plots/20250214_nnsvg.png")
+```
+
+#various options from here:
+#convert to zar object and use spatialdata to align images (20250214_python_sptial.py)
+#continue in  with https://bookdown.org/sjcockell/ismb-tutorial-2023/practical-session-3.html#neighbour-graph-and-distance-matrix
+
+for clustering (with histo classifiersas priors) etc (see spatial_workflow doc)
+
+
+
+
+Dimensionality reduction: 
+PCA uses a linear transformation of the data, which aims at defining new dimensions (axis) that capture most of the variance observed in the original data.
+The results of PCA can be used in downstream analysis.
+
+t-SNE and UMAP are both non-linear methods of dimensionality reduction. They aim at keeping similar cells together and dissimilar clusters of cells apart from each other.
+
+SingleCellExperiment objects contain a slot that can store representations of our data in reduced dimensions. runPCA() function runs PCA on a SCE object, and returns an updated version of the single cell object with the PCA result added to the reducedDim slot.
+
+```{r dimensionality reduction PCA}
+# compute PCA
+set.seed(123)
+spe_filt <- runPCA(spe_filt, subset_row = top_hvgs) #restrict PCA to use only HVGs
+#returns top 50 PCs by default
+reducedDimNames(spe_filt)
+dim(reducedDim(spe_filt, "PCA"))
+
+percent.var <- attr(reducedDim(spe_filt), "percentVar")
+
+#determine optimum number of PCs to use
+chosen_elbow <- PCAtools::findElbowPoint(percent.var)
+
+plot(percent.var, log = "y", xlab = "PC", ylab = "Variance explained (%)")
+abline(v=chosen_elbow, col="dodgerblue")
+
+```
+#Run UMAP on the set of top 50 PCs and retain top 2 UMAP components for visualization 
+```{r dim reduction UMAP}
+
+# compute UMAP on top 50 PCs
+set.seed(123)
+spe_filt <- runUMAP(spe_filt, dimred = "PCA")
+
+reducedDimNames(spe_filt)
+dim(reducedDim(spe_filt, "UMAP"))
+
+# update column names for easier plotting
+colnames(reducedDim(spe_filt, "UMAP")) <- paste0("UMAP", 1:2)
+
+# plot top 2 PCA dimensions
+plotDimRed(spe_filt, type = "PCA")
+
+```
+```{r}
+# plot top 2 UMAP dimensions
+plotDimRed(spe_filt, type = "UMAP")
+```
+
+https://bioinformatics-core-shared-training.github.io/SingleCell_RNASeq_Jan24/UnivCambridge_ScRnaSeqIntro_Base/Markdowns/07_Dataset_Integration.html
+
+```{r batch correction}
+
+```
+
+
+Cluster gene expression via scRNAseq methods
+Graph-based clustering using the Walktrap method implemented in scran (Lun, McCarthy, and Marioni 2016), applied to the top 50 PCs calculated on the set of top HVGs.Assume that biologically informative spatial distribution patterns of cell types can be detected from the molecular features (gene expression).
+```{r clustering to identify spatial domains}
+# graph-based clustering
+set.seed(123)
+k <- 10
+g <- buildSNNGraph(spe_filt, k = k, use.dimred = "PCA")
+g_walk <- igraph::cluster_walktrap(g)
+clus <- g_walk$membership
+table(clus)
+
+# store cluster labels in column 'label' in colData
+colLabels(spe_filt) <- factor(clus)
+```
+
+```{r}
+# plot clusters in spatial x-y coordinates
+# Example of dynamically assigning colors based on the number of spots
+# Example of a color palette generator
+my_palette <- my_palette <- rainbow(37)
+
+
+spots <- plotSpots(spe_filt, annotate = "label",
+          palette = my_palette)
+
+spots
+```
+```{r}
+# plot clusters in PCA reduced dimensions
+pca <- plotDimRed(spe_filt, type = "PCA", 
+           annotate = "label", palette = my_palette)
+
+pca
+```
+```{r}
+# plot clusters in UMAP reduced dimensions
+umap <- plotDimRed(spe_filt, type = "UMAP", 
+           annotate = "label", palette = my_palette)
+
+umap
+```
+
+```{r}
+# set gene names as row names for easier plotting
+rownames(spe_filt) <- rowData(spe_filt)$symbol
+
+# test for marker genes
+markers <- findMarkers(spe_filt, test = "binom", direction = "up")
+
+# returns a list with one DataFrame per cluster
+markers
+```
+
+```{r}
+# plot log-fold changes for one cluster over all other clusters
+# selecting cluster 1
+interesting <- markers[[1]]
+best_set <- interesting[interesting$Top <= 5, ]
+logFCs <- getMarkerEffects(best_set)
+
+pheatmap::pheatmap(logFCs, breaks = seq(-5, 5, length.out = 101))
+
+
+```
+
+
+Both the SpatialImage (SpI) and SpatialExperiment (SpE) class currently support two basic image transformations, namely, rotation (via rotateImg()) and mirroring (via mirrorImg()). Specifically, for a SpI/E x:
+
+rotateImg(x, degrees) expects as degrees a single numeric in +/-[0,90,…,360].
+Here, a (negative) positive value corresponds to (counter-)clockwise rotation.
+mirrorImg(x, axis) expects as axis a character string specifying
+whether to mirror horizontally ("h") or vertically ("v").
+see https://www.bioconductor.org/packages/release/bioc/vignettes/SpatialExperiment/inst/doc/SpatialExperiment.html
