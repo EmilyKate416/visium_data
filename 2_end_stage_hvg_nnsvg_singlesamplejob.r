@@ -53,6 +53,10 @@ tryCatch({
     spe_sub <- spe_sub[, !ix_zero_spots]
   }
 
+  # Remove mitochondrial genes
+  mito_genes <- grep("^MT-", rowData(spe_sub)$symbol, value = TRUE)
+  spe_sub <- spe_sub[!rowData(spe_sub)$symbol %in% mito_genes, ]
+
   # Use nnSVG function to filter lowly expressed genes
   spe_sub <- filter_genes(spe_sub, filter_mito=FALSE)
 
@@ -67,9 +71,9 @@ tryCatch({
   rowData(spe_sub)$hvg <-rownames(spe_sub)  %in% top_hvgs
 
   # Save intermediate results
-  saveRDS(spe_sub, file = paste0("/mnt/scratchc/fmlab/lythgo02/visium_data/single_sample_from_filtering/20250321_spe_sub_modelgenevar_", sample, ".rds"))
-  #saveRDS(top_hvgs, file = paste0("/mnt/scratchc/fmlab/lythgo02/visium_data/single_sample_from_filtering/20250321_hvg_", sample, ".rds"))
-  saveRDS(dec, file = paste0("/mnt/scratchc/fmlab/lythgo02/visium_data/single_sample_from_filtering/20250321_dec_", sample, ".rds"))
+  base::saveRDS(spe_sub, file = paste0("/mnt/scratchc/fmlab/lythgo02/visium_data/single_sample_from_filtering/no_mito/20250815_spe_sub_modelgenevar_", sample, ".rds"))
+  base::saveRDS(top_hvgs, file = paste0("/mnt/scratchc/fmlab/lythgo02/visium_data/single_sample_from_filtering/no_mito/20250815_hvg_", sample, ".rds"))
+  #saveRDS(dec, file = paste0("/mnt/scratchc/fmlab/lythgo02/visium_data/single_sample_from_filtering/20250321_dec_", sample, ".rds"))
 
   # Ensure 'logcounts' exists before running nnSVG
   if (!"logcounts" %in% assayNames(spe_sub)) {
@@ -80,8 +84,12 @@ tryCatch({
   spe_sub_nnSVG <- nnSVG(spe_sub, assay_name = "logcounts")
 
   # Save the final spe_sub with nnSVG results
-  saveRDS(spe_sub_nnSVG, file = paste0("/mnt/scratchc/fmlab/lythgo02/visium_data/single_sample_from_filtering/20250321_spe_sub_nnSVG_", sample, ".rds"))
-
+  base::saveRDS(spe_sub_nnSVG, file = paste0("/mnt/scratchc/fmlab/lythgo02/visium_data/single_sample_from_filtering/no_mito/20250815_spe_sub_nnSVG_", sample, ".rds"))
+  #back up save
+  HDF5Array::saveHDF5SummarizedExperiment(
+  spe_sub,
+  file = paste0("/mnt/scratchc/fmlab/lythgo02/visium_data/single_sample_from_filtering/no_mito/20250815_spe_sub_modelgenevar_", sample, ".h5se")
+  )
  # cat("Successfully processed and saved sample:", sample, "\n")
 
 }, error = function(e) {
