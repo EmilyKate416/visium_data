@@ -39,7 +39,37 @@ group_df <- read_csv(paste0(results, "cluster_counts.csv")) %>% rename(sample = 
 
 kegg_cat <- readxl::read_excel(paste0(nas, "categories_kegg.xlsx")) %>% rename("Description"="description")
 
-spe_list_nnsvg <- readRDS(file.path(results, "spe_list_nnsvg_clusters.rds"))
+msigdb_compare <- readRDS(paste0(results, "msigdb_comparecluster_results.rds"))
+
+#spe_list_nnsvg <- readRDS(file.path(results, "spe_list_nnsvg_clusters.rds"))
+```
+```{r}
+immune_clusters <- data.frame(
+  sample = c(
+    "SITSC1","SITSD2","SITSH2","SITSC2",
+    "SITSA3","SITSA1","SITSD4","SITSG2","SITSB3",
+    "SITSB1","SITSD1","SITSA4","SITSB4","SITSF2",
+    "SITSC3","SITSF4","SITSE4",
+    "SITSB2","SITSD3","SITSC4","SITSA2","SITSE2"
+  ),
+  ov04 = c(
+    "831","1296","1350","1126",
+    "890","938_ov1","931","1239","938_ov2",
+    "771","982_ov","737","853","750_ov",
+    "1314_ov1","1314_ov2","1367",
+    "650","1210","982_om","977","750_om"
+  ),
+  immune_cat = c(
+    "Immune desert","Macrophage dominant","Macrophage dominant","Effector dominant",
+    "Macrophage dominant","Immune desert","Immune desert","Macrophage dominant","Immune desert",
+    "Effector dominant","Immune desert","Macrophage dominant","Immune desert","Immune desert",
+     "Macrophage dominant","Macrophage dominant","Immune desert",
+    "Effector dominant","Effector dominant","Immune desert","Immune desert","Effector dominant"
+  ),
+  stringsAsFactors = FALSE
+)
+
+group_df <- full_join(immune_clusters, group_df)
 ```
 
 ```{r plot spots}
@@ -63,7 +93,7 @@ for (sample in names(spe_list_nnsvg)) {
      spe <- spe_list_nnsvg[[sample]]
      plotSpots(spe, annotate = "label",
                pal=cluster_colors)
-     ggsave(filename =  file.path(results, paste0(sample, "_SVGs_clustered.png")), width = 6, height = 6)}
+     ggsave(filename =  file.path(nas, paste0(sample, "_SVGs_clustered.png")), width = 6, height = 6)}
 ```
 
 
@@ -78,7 +108,7 @@ filtered_go <- lapply(go_results_list, function(x) {
     FoldEnrichment > 2 &
        Count >= 5 &
     !grepl("melanoma|lung|leukemia|renal|bladder|thyroid|pancreatic|prostate|gastric|hepatocellular|hepatocyte|neuron|oocyte|longevity|colorectal|axon|endometrial|osteoclast|retrograde|amphetamine|cardiac|water reabsorption|duct|osteoblast|forebrain|mammary", Description, ignore.case = TRUE) &
-    !grepl("acid|Endocrine|Aldosterone|Renin|Salivary|sexual|skin|skeletal|ureteric|heart|digestive|ear|sex|kidney|utero|organ|respiration|bone", Description, ignore.case = TRUE)  
+    !grepl("acid|Endocrine|Aldosterone|Renin|Salivary|sexual|skin|skeletal|ureteric|heart|digestive|ear|sex|kidney|utero|organ|respiration|bone|spine", Description, ignore.case = TRUE)  
   )
   y
 })
@@ -98,29 +128,11 @@ go_summary <- go_summary %>%
 
 ```
 
-```{r go plots}
-plots <- lapply(names(filtered_go), function(x){
-  sample <- filtered_go[[x]]
-  dotplot(sample, show=15) +
-    ggtitle(x) +
-    theme_minimal()
-})
-names(plots) <- names(filtered_go)  
-lapply(names(plots), function(x){
-  sample <- plots[[x]]
- # ggsave(filename = paste0(results, x, "_kegg.pdf"), plot = sample, width = 8, height = 6)
-})
-
-combined_plot <- wrap_plots(plots, ncol = 4)  # adjust ncol as needed
-
-# Save it
-ggsave(paste0(results, "combined_go_dotplot.pdf"), combined_plot, width = 24, height = 49.9)
-```
-
 
 ```{r kegg data wrangling}
 
 
+   
 filtered_kegg <- lapply(kegg_compare, function(x) {
   y <- x
   y@compareClusterResult <- subset(
@@ -129,9 +141,10 @@ filtered_kegg <- lapply(kegg_compare, function(x) {
     FoldEnrichment > 2 &
   #  Count >= 5 &
     !grepl("disease", subcategory, ignore.case=TRUE) &
-    !grepl("melanoma|lung|leukemia|renal|bladder|thyroid|pancreatic|prostate|gastric|hepatocellular|oocyte|longevity|colorectal|axon|endometrial|osteoclast|retrograde|amphetamine|cardiac|water reabsorption|duct acid|Endocrine|Aldosterone|Renin|Salivary|viral|virion", Description, ignore.case = TRUE)  
+    #removing terms not related to HGSOC
+    !grepl("melanoma|lung|leukemia|renal|bladder|thyroid|pancreatic|prostate|gastric|hepatocellular|oocyte|longevity|colorectal|axon|endometrial|osteoclast|retrograde|amphetamine|cardiac|water reabsorption|duct acid|Endocrine|Aldosterone|Renin|Salivary|viral|virion|cytoskeleton in muscle|complement|protein digestion|Apoptosis - multiple species|Autophagy - other|Hippo signaling pathway - multiple species|transcriptional misregulation in cancer", Description, ignore.case = TRUE)  
   ) %>% left_join(kegg_cat, by="Description") %>% 
-     filter(!simplified_subcategory %in% c("Cell process","Other","Intracellular regulation","Cell plasticity & stemness signaling")) 
+     filter(!simplified_subcategory %in% c("Cell process","Other","Intracellular regulation","Cell plasticity & stemness signaling", "ECM & cell adhesion")) 
   y
 })
 
@@ -148,39 +161,6 @@ kegg_summary <- kegg_summary %>%
 
 ```
 
-```{r kegg plots}
-plots <- lapply(names(filtered_kegg), function(x){
-  sample <- filtered_kegg[[x]]
-  #sample@compareClusterResult <- sample@compareClusterResult %>% 
-   # filter(simplified_subcategory %in% c("Inflammation & immune activation")) 
-  dotplot(sample,  show=10) +
-    ggtitle(x) +
-    facet_grid(simplified_subcategory ~ ., scales = "free_y", space = "free_y") +
-    theme_minimal() +
-    labs(x = "Cluster", y = NULL) +
-    theme_minimal(base_size = 12) +
-    theme(
-      strip.text.y = element_text(size = 9, face = "bold", margin = margin(2,6,2,6)),
-      strip.background = element_rect(fill = "grey95", colour = NA),
-      axis.text.y = element_text(size = 9),
-      axis.text.x = element_text(size = 10),
-      panel.grid.major.x = element_blank(),
-      panel.grid.minor = element_blank(),
-      panel.spacing.y = unit(6, "pt"),
-      legend.position = "none"
-    )
-})
-names(plots) <- names(filtered_kegg)  
-lapply(names(plots), function(x){
-  sample <- plots[[x]]
- # ggsave(filename = paste0(results, x, "_kegg.pdf"), plot = sample, width = 8, height = 6)
-})
-
-combined_plot <- wrap_plots(plots, ncol = 4)  # adjust ncol as needed
-
-# Save it
-ggsave(paste0(results, "combined_kegg_dotplot.pdf"), combined_plot, width = 26, height = 49.9)
-```
 
 
 ```{r reactome data wrangling}
@@ -215,51 +195,131 @@ react_summary <- react_summary %>%
   left_join(group_df, by = "sample")
 ```
 
-```{r reactome plots}
-plots <- lapply(names(filtered_reactome), function(x){
-  sample <- filtered_reactome[[x]]
-  dotplot(sample, show=15) +
-    ggtitle(x) +
-    theme_minimal()
+
+
+Check cluster enrichment of hallmark pathways - MSigDB
+```{r}
+   # 1) Filter MSigDB compareCluster results (NO grepl filters)
+filtered_msigdb <- lapply(msigdb_compare, function(x) {
+  y <- x
+  y@compareClusterResult <- subset(
+    x@compareClusterResult,
+    p.adjust < 0.05 #&
+    #  FoldEnrichment > 2 &
+    #  Count >= 5
+  )
+  y
 })
-names(plots) <- names(filtered_reactome)  
-lapply(names(plots), function(x){
-  sample <- plots[[x]]
- # ggsave(filename = paste0(results, x, "_kegg.pdf"), plot = sample, width = 8, height = 6)
-})
 
-library(patchwork)
+# 2) Convert to one dataframe with sample column
+filtered_msigdb_df <- lapply(names(filtered_msigdb), function(x) {
+  df <- as.data.frame(filtered_msigdb[[x]])
+  df$sample <- x
+  df
+}) %>%
+  bind_rows()
 
-# Combine all plots in a grid layout
-combined_plot <- wrap_plots(plots, ncol = 4)  # adjust ncol as needed
+# 3) Clean names + join subgroup info
+msigdb_summary <- filtered_msigdb_df %>%
+  janitor::clean_names() %>%
+  left_join(group_df, by = "sample") %>% 
+  mutate(id = str_remove(description, "HALLMARK_"),
+           category = case_when(
+id %in% c(
+        "BILE_ACID_METABOLISM",
+        "CHOLESTEROL_HOMEOSTASIS",
+        "FATTY_ACID_METABOLISM",
+        "GLYCOLYSIS",
+        "ADIPOGENESIS",
+        "HEME_METABOLISM"
+      ) ~ "Metabolism",
 
+      id %in% c(
+        "E2F_TARGETS", "G2M_CHECKPOINT",
+        "MYC_TARGETS_V1", "MYC_TARGETS_V2",
+        "MITOTIC_SPINDLE",
+        "KRAS_SIGNALING_UP", "KRAS_SIGNALING_DOWN",
+        "PI3K_AKT_MTOR_SIGNALING", "MTORC1_SIGNALING",
+        "NOTCH_SIGNALING",
+        "HEDGEHOG_SIGNALING",
+        "WNT_BETA_CATENIN_SIGNALING",
+        "ANDROGEN_RESPONSE",
+        "TGF_BETA_SIGNALING",
+        "EPITHELIAL_MESENCHYMAL_TRANSITION",
+        "ESTROGEN_RESPONSE_EARLY", "ESTROGEN_RESPONSE_LATE"
+      ) ~ "Cell proliferation & oncogenic signaling",
 
-# Save it
-ggsave(paste0(results, "combined_reactome_dotplot.pdf"), combined_plot, width = 24, height = 49.9)
+      id %in% c(
+        "HYPOXIA",
+        "UNFOLDED_PROTEIN_RESPONSE",
+        "REACTIVE_OXYGEN_SPECIES_PATHWAY",
+        "PROTEIN_SECRETION",
+        "APOPTOSIS",
+        "OXIDATIVE_PHOSPHORYLATION"
+      ) ~ "Cell stress & homeostasis",
+
+      id %in% c(
+        "ALLOGRAFT_REJECTION",
+        "COAGULATION",
+        "COMPLEMENT",
+        "INTERFERON_ALPHA_RESPONSE",
+        "INTERFERON_GAMMA_RESPONSE",
+        "IL6_JAK_STAT3_SIGNALING",
+        "IL2_STAT5_SIGNALING",
+        "TNFA_SIGNALING_VIA_NFKB",
+        "INFLAMMATORY_RESPONSE"
+      ) ~ "Immune",
+
+      id %in% c(
+        "ANGIOGENESIS"
+      ) ~ "Vasculature",
+
+      id %in% c(
+        "DNA_REPAIR",
+        "P53_PATHWAY",
+        "UV_RESPONSE_UP",
+        "UV_RESPONSE_DN"
+      ) ~ "DNA & genome integrity",
+
+      TRUE ~ NA_character_
+    )
+  ) %>% 
+    filter(!description %in% c(
+    "HALLMARK_APICAL_JUNCTION",
+    "HALLMARK_MYOGENESIS",
+#    "HALLMARK_ALLOGRAFT_REJECTION",
+    "HALLMARK_HEME_METABOLISM",
+    "HALLMARK_BILE_ACID_METABOLISM",
+    "HALLMARK_E2F_TARGETS", 
+    "HALLMARK_G2M_CHECKPOINT", 
+    "HALLMARK_MITOTIC_SPINDLE",
+     "HALLMARK_ANDROGEN_RESPONSE",
+    "HALLMARK_ADIPOGENESIS"
+  ))
 ```
 
-```{r kegg_group plot cluster proportions }
-kegg_group_plot <- kegg_summary %>% 
-  filter(!simplified_subcategory %in% c("Cell process","Other","Cell plasticity & stemness signaling", "Intracellular regulation")) %>% 
-   group_by(sample, description) %>%
+Per sample hallmark pathway plots https://pmc.ncbi.nlm.nih.gov/articles/PMC4707969/ with clusters summarised as proportion of clusters showing pathway activity for each sample. Facet by immune group or genotype
+
+
+```{r}
+msigdb_group_plot <- msigdb_summary %>%
+  # total number of clusters per sample (denominator)
+  group_by(sample) %>%
+  mutate(n_clusters = n_distinct(cluster)) %>%
+  ungroup() %>%
+  # number of clusters where each term appears (numerator)
+  group_by(sample, description) %>%
   mutate(n_clusters_with_term = n_distinct(cluster)) %>%
-   mutate(prop_clusters = n_clusters_with_term / n_clusters) %>% 
-  ungroup()
-
-
+  ungroup() %>%
+  mutate(prop_clusters = n_clusters_with_term / n_clusters)
 
 ggplot(
-  kegg_group_plot,
-  aes(
-    x = sample,
-    y = description,
-    size = prop_clusters
-  )
-) +
-  geom_point(alpha = 0.8) +
+  msigdb_group_plot,
+  aes(x = ov04, y = description, size = prop_clusters)
+) +  geom_point(alpha = 0.8) +
   facet_grid(         # from ggh4x, nicer control than base facet_grid
-    rows = vars(simplified_subcategory),
-    cols = vars(genotype),
+    rows = vars(category),
+    cols = vars(immune_cat),  #genotype or immune_cat
     scales = "free",
     space = "free"
   ) +
@@ -276,9 +336,124 @@ ggplot(
     axis.title.y = element_blank()
   ) +
   guides(size = guide_legend(override.aes = list(alpha = 1)))
-ggsave(paste0(results, "kegg_cluster_proportions.pdf"), width=15, height = 20)
+ggsave(paste0(nas, "plots/msigdb_cluster_proportions_immune.pdf"),
+       width = 15, height = 15)
 
 ```
+
+SUmmary across clusters per sample, faceted by immune group or genotype 
+```{r kegg_group plot cluster proportions }
+kegg_group_plot <- kegg_summary %>% 
+  filter(!simplified_subcategory %in% 
+           c("Cell process",
+             "Other",
+             "Cell plasticity & stemness signaling", 
+             "Intracellular regulation", 
+             "Metabolism")) %>%
+   group_by(sample, description) %>%
+  mutate(n_clusters_with_term = n_distinct(cluster)) %>%
+   #removing pathways present in most samples 
+  filter(!grepl("Relaxin signaling pathway", description, ignore.case = TRUE)) %>%  
+  #remove pathways that are present in too few cases to conclude anything meaningful
+  filter(!grepl("GnRH signaling pathway|cGMP-PKG signaling pathway", description, ignore.case = TRUE)) %>%  
+   mutate(prop_clusters = n_clusters_with_term / n_clusters) %>% 
+  ungroup() 
+ 
+ggplot(
+  kegg_group_plot,
+  aes(
+    x = ov04,
+    y = description,
+    size = prop_clusters
+  )
+) +
+  geom_point(alpha = 0.8) +
+  facet_grid(         # from ggh4x, nicer control than base facet_grid
+    rows = vars(simplified_subcategory),
+    cols = vars(immune_cat),  #or immune_cat
+    scales = "free",
+    space = "free"
+  ) +
+  scale_size_continuous(name = "Proportion of clusters") +
+  theme_minimal(base_size = 9) +
+  theme(
+    panel.grid.major.y = element_line(color = "grey85", linewidth = 0.3),
+    panel.grid.major.x = element_line(color = "grey90", linewidth = 0.3),
+    panel.border = element_rect(color = "grey50", fill = NA, linewidth = 0.5),
+    strip.background = element_rect(fill = "#1f78b4", color = NA),  # blue banner
+    strip.text = element_text(color = "white", face = "bold", size = 9),
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank()
+  ) +
+  guides(size = guide_legend(override.aes = list(alpha = 1)))
+ggsave(paste0(nas, "plots/kegg_cluster_proportions_immune.pdf"), width=15, height = 20)
+
+```
+#just for reference, not to use
+```{r}
+
+# 0) Add unique cluster id once + apply your subcategory filter once
+kegg_use <- kegg_summary %>%
+  mutate(cluster_id = paste(sample, cluster, sep = "_")) %>%
+  filter(!simplified_subcategory %in%
+           c("Cell process",
+             "Other",
+             "Cell plasticity & stemness signaling",
+             "Intracellular regulation")) %>% 
+  filter(!grepl("Relaxin signaling pathway", description, ignore.case = TRUE)) %>%  
+  #remove pathways that are present in too few cases to conclude anything meaningful
+  filter(!grepl("GnRH signaling pathway|cGMP-PKG signaling pathway", description, ignore.case = TRUE)) 
+
+# 1) Denominator: number of unique clusters in each immune category
+immune_cat_totals <- kegg_use %>%
+  distinct(cluster_id, immune_cat) %>%
+  count(immune_cat, name = "n_clusters")
+
+# 2) Numerator: number of unique clusters that have each pathway (per immune_cat)
+immune_cat_pathways <- kegg_use %>%
+  distinct(cluster_id, immune_cat, simplified_subcategory, description) %>%  # key fix
+  count(immune_cat, simplified_subcategory, description, name = "n_clusters_with_term") %>%
+  left_join(immune_cat_totals, by = "immune_cat") %>%
+  mutate(prop_clusters = n_clusters_with_term / n_clusters)
+
+# 3) Plot
+p <- ggplot(
+  immune_cat_pathways,
+  aes(
+    x = immune_cat,
+    y = fct_reorder(description, prop_clusters),
+    size = prop_clusters
+  )
+) +
+  geom_point(alpha = 0.85) +
+  facet_grid(
+    rows = vars(simplified_subcategory),
+    scales = "free_y",
+    space = "free_y"
+  ) +
+  scale_size_continuous(name = "Proportion of clusters") +
+  theme_minimal(base_size = 9) +
+  theme(
+    panel.grid.major.y = element_line(color = "grey85", linewidth = 0.3),
+    panel.grid.major.x = element_line(color = "grey90", linewidth = 0.3),
+    panel.border = element_rect(color = "grey50", fill = NA, linewidth = 0.5),
+    strip.background = element_rect(fill = "#1f78b4", color = NA),
+    strip.text = element_text(color = "white", face = "bold", size = 9),
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    axis.title = element_blank()
+  ) +
+  guides(size = guide_legend(override.aes = list(alpha = 1)))
+
+p
+ggsave(paste0(nas, "/plots/immune_pooled.pdf"), plot = p, width = 15, height = 20)
+
+
+```
+
+
+#genomic subgroup plots KEGG
+
 ```{r}
 brca1 <- kegg_group_plot %>% 
   filter(genotype=="gBRCA1m")
@@ -296,7 +471,157 @@ genotypes <- list(
   non_BRCA_HRD = nonBRCAHRD
 )
 
+```
 
+plot all samples one one faceted by genotype 
+```{r}
+
+combined_df <- bind_rows(
+  lapply(names(genotypes), function(i) {
+    genotypes[[i]] %>%
+      mutate(genotype = i)
+  })
+)
+p <- ggplot(combined_df, aes(x = cluster, y = description, colour=immune_cat)) +
+  geom_point(alpha = 0.8) +
+  facet_grid(
+    rows = vars(simplified_subcategory),
+    cols = vars(genotype, ov04),
+    scales = "free",
+    space  = "free"
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(
+    strip.background = element_rect(fill = "#1f78b4", color = NA),
+    strip.text = element_text(
+      color  = "white",
+      face   = "bold",
+      size   = 7,
+      margin = margin(1, 2, 1, 2)
+    ),
+    panel.spacing.y = unit(2, "pt"),
+    panel.spacing.x = unit(2, "pt"),
+    panel.border = element_rect(color = "grey60", fill = NA, linewidth = 0.4),
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+    axis.title = element_blank()
+  )
+
+ggsave(
+    filename = file.path(nas, paste0("/plots/kegg_all.pdf")),
+    plot = p,
+    width = 20,
+    height = 9
+  )
+
+```
+
+plot individual plots per genotype 
+```{r}
+library(grid)   # for unit()
+
+lapply(names(genotypes), function(i) {
+  df <- genotypes[[i]]
+
+  p <- ggplot(df, aes(x = cluster, y = description, colour=immune_cat)) +
+    geom_point(alpha = 0.8) +
+    facet_grid(
+      rows = vars(simplified_subcategory),
+      cols = vars(ov04),
+      scales = "free",
+      space  = "free"
+    ) +
+    theme_minimal(base_size = 9) +
+    theme(
+      strip.background = element_rect(fill = "#1f78b4", color = NA),
+      strip.text = element_text(
+        color  = "white",
+        face   = "bold",
+        size   = 7,
+        margin = margin(1, 2, 1, 2)
+      ),
+      panel.spacing.y = unit(2, "pt"),
+      panel.spacing.x = unit(2, "pt"),
+      panel.border = element_rect(color = "grey60", fill = NA, linewidth = 0.4),
+      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+      axis.title.x = element_blank(),
+      axis.title.y = element_blank()
+    ) +
+    guides(size = guide_legend(override.aes = list(alpha = 1))) +
+    ggtitle(i)
+
+  # Save the figure
+#  ggsave(filename = file.path(nas, paste0("/plots/kegg_", i, ".pdf")), plot = p,width = 10,height = 15)
+
+  return(p)
+})
+
+
+```
+#genomic subgroup plots Hallmark
+
+```{r}
+brca1 <- msigdb_group_plot %>% 
+  filter(genotype=="gBRCA1m")
+brca2 <- msigdb_group_plot %>% 
+  filter(genotype=="gBRCA2m")
+HRP <- msigdb_group_plot %>% 
+  filter(genotype=="HRP")
+nonBRCAHRD <- msigdb_group_plot %>% 
+  filter(genotype=="non-BRCA-HRD")
+
+genotypes <- list(
+  BRCA1 = brca1,
+  BRCA2 = brca2,
+  HRP = HRP,
+  non_BRCA_HRD = nonBRCAHRD
+)
+
+```
+
+plot all samples one one faceted by genotype or immune_cat
+```{r}
+
+combined_df <- bind_rows(
+  lapply(names(genotypes), function(i) {
+    genotypes[[i]] %>%
+      mutate(genotype = i)
+  })
+)
+p <- ggplot(combined_df, aes(x = cluster, y = description, colour = genotype)) +
+  geom_point(alpha = 0.8) +
+  facet_grid(
+    rows = vars(category),
+    cols = vars(immune_cat, ov04),
+    scales = "free",
+    space  = "free"
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(
+    strip.background = element_rect(fill = "#1f78b4", color = NA),
+    strip.text = element_text(
+      color  = "white",
+      face   = "bold",
+      size   = 7,
+      margin = margin(1, 2, 1, 2)
+    ),
+    panel.spacing.y = unit(2, "pt"),
+    panel.spacing.x = unit(2, "pt"),
+    panel.border = element_rect(color = "grey60", fill = NA, linewidth = 0.4),
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+    axis.title = element_blank()
+  )
+
+ggsave(
+    filename = file.path(nas, paste0("/plots/msig_all.pdf")),
+    plot = p,
+    width = 20,
+    height = 8
+  )
+
+```
+
+
+```{r}
 library(grid)   # for unit()
 
 lapply(names(genotypes), function(i) {
@@ -305,8 +630,8 @@ lapply(names(genotypes), function(i) {
   p <- ggplot(df, aes(x = cluster, y = description)) +
     geom_point(alpha = 0.8) +
     facet_grid(
-      rows = vars(simplified_subcategory),
-      cols = vars(sample),
+      rows = vars(category),
+      cols = vars(ov04),
       scales = "free",
       space  = "free"
     ) +
@@ -331,10 +656,10 @@ lapply(names(genotypes), function(i) {
 
   # Save the figure
   ggsave(
-    filename = file.path(results, paste0("kegg_", i, ".pdf")),
+    filename = file.path(nas, paste0("/plots/hallmark_", i, ".pdf")),
     plot = p,
     width = 10,
-    height = 15
+    height = 10
   )
 
   return(p)
@@ -343,7 +668,8 @@ lapply(names(genotypes), function(i) {
 
 ```
 
-#pull out immune related terms
+
+#pull out immune related terms GO results
 ```{r}
 immune <- paste(
 c(  "tumor",
@@ -395,26 +721,30 @@ immune_related <- go_summary %>%
 ```{r}
 immune_related <- immune_related %>%
   mutate(group = case_when(
-    # 1. Fibroblast / ECM / Wound Repair
+
+    # 1. Stromal / Fibroblast / Angiogenesis
     description %in% c(
       "angiogenesis involved in wound healing",
+      "sprouting angiogenesis",
+      "cell migration involved in sprouting angiogenesis",
+      "regulation of angiogenesis",
+      "positive regulation of angiogenesis",
+      "negative regulation of angiogenesis",
       "cellular response to fibroblast growth factor stimulus",
-      "cellular response to tumor necrosis factor",
+      "response to fibroblast growth factor",
       "fibroblast proliferation",
+      "fibroblast migration",
+      "fibroblast activation",
+      "fibroblast apoptotic process",
       "positive regulation of fibroblast migration",
       "positive regulation of fibroblast proliferation",
       "regulation of fibroblast migration",
       "regulation of fibroblast proliferation",
-      "fibroblast apoptotic process",
-      "regulation of fibroblast apoptotic process",
-      "fibroblast migration",
-      "fibroblast activation",
-      "cell migration involved in sprouting angiogenesis",
-      "regulation of angiogenesis",
-      "positive regulation of angiogenesis"
-    ) ~ "Fibroblast / ECM / Wound Repair",
-    
-    # 2. Innate Immunity / Myeloid
+      "negative regulation of fibroblast proliferation",
+      "regulation of fibroblast apoptotic process"
+    ) ~ "Stromal / Fibroblast / Angiogenesis",
+
+    # 2. Myeloid Innate Immunity
     description %in% c(
       "monocyte chemotaxis",
       "monocyte differentiation",
@@ -423,20 +753,63 @@ immune_related <- immune_related %>%
       "macrophage activation",
       "neutrophil activation",
       "neutrophil activation involved in immune response",
-      "positive regulation of macrophage chemotaxis",
-      "positive regulation of monocyte differentiation",
       "myeloid leukocyte activation",
       "leukocyte activation involved in inflammatory response",
       "leukocyte activation involved in immune response",
-      "positive regulation of myeloid leukocyte cytokine production involved in immune response",
+      "positive regulation of macrophage chemotaxis",
+      "positive regulation of monocyte differentiation",
       "macrophage cytokine production",
       "positive regulation of macrophage cytokine production",
       "regulation of macrophage cytokine production",
       "regulation of macrophage activation",
-      "response to macrophage colony-stimulating factor"
-    ) ~ "Innate Immunity / Myeloid",
-    
-    # 3. Adaptive Immunity / Lymphocytes
+      "response to macrophage colony-stimulating factor",
+      "regulation of monocyte chemotaxis",
+      "regulation of macrophage chemotaxis",
+      "regulation of macrophage differentiation",
+      "positive regulation of neutrophil migration",
+      "macrophage derived foam cell differentiation",
+      "negative regulation of macrophage derived foam cell differentiation",
+      "macrophage apoptotic process"
+    ) ~ "Myeloid Innate Immunity",
+
+    # 3. Antigen Presentation & Dendritic Cells
+    description %in% c(
+      "dendritic cell antigen processing and presentation",
+      "regulation of dendritic cell antigen processing and presentation",
+      "regulation of dendritic cell cytokine production"
+    ) ~ "Antigen Presentation & Dendritic Cells",
+
+    # 4. Adaptive Immunity - T cells
+    description %in% c(
+      "alpha-beta T cell activation",
+      "alpha-beta T cell activation involved in immune response",
+      "CD4-positive, alpha-beta T cell activation",
+      "T cell activation involved in immune response",
+      "T cell proliferation",
+      "T cell differentiation",
+      "T cell lineage commitment",
+      "alpha-beta T cell lineage commitment",
+      "T-helper 17 cell lineage commitment",
+      "T-helper cell differentiation",
+      "T-helper 1 type immune response",
+      "regulation of CD4-positive, alpha-beta T cell activation",
+      "regulation of T cell activation",
+      "positive regulation of T cell activation",
+      "negative regulation of T cell activation",
+      "regulation of T cell proliferation",
+      "positive regulation of T cell proliferation",
+      "positive regulation of T cell differentiation",
+      "T cell cytokine production",
+      "regulation of T cell cytokine production",
+      "positive regulation of T cell mediated immunity",
+      "positive regulation of T cell receptor signaling pathway",
+      "regulation of T cell receptor signaling pathway",
+      "negative regulation of T cell receptor signaling pathway",
+      "positive regulation of leukocyte mediated cytotoxicity",
+      "regulation of T cell chemotaxis"
+    ) ~ "Adaptive Immunity - T cells",
+
+    # 5. Adaptive Immunity - B cells & Humoral
     description %in% c(
       "B cell activation",
       "B cell differentiation",
@@ -444,65 +817,60 @@ immune_related <- immune_related %>%
       "B cell proliferation",
       "pro-B cell differentiation",
       "plasma cell differentiation",
-      "CD4-positive, alpha-beta T cell activation",
-      "alpha-beta T cell activation involved in immune response",
-      "T cell activation involved in immune response",
-      "T cell differentiation",
-      "T cell proliferation",
-      "lymphocyte differentiation",
-      "lymphocyte mediated immunity",
-      "lymphocyte proliferation",
-      "T cell lineage commitment",
-      "alpha-beta T cell lineage commitment",
-      "T-helper 17 cell lineage commitment",
-      "T-helper cell differentiation",
-      "T-helper 1 type immune response",
-      "regulation of lymphocyte differentiation",
-      "positive regulation of lymphocyte differentiation",
-      "regulation of T-helper cell differentiation",
-      "positive regulation of T-helper cell differentiation",
-      "regulation of CD4-positive, alpha-beta T cell activation",
-      "regulation of T cell activation",
-      "positive regulation of T cell activation",
-      "negative regulation of T cell activation",
-      "regulation of T cell proliferation",
-      "regulation of T cell cytokine production",
-      "T cell cytokine production",
-      "positive regulation of T cell mediated immunity",
-      "positive regulation of T cell receptor signaling pathway",
-      "regulation of T cell receptor signaling pathway",
+      "B cell apoptotic process",
       "regulation of B cell activation",
       "regulation of B cell differentiation",
       "regulation of B cell proliferation",
-      "adaptive immune response based on somatic recombination of immune receptors built from immunoglobulin superfamily domains",
       "humoral immune response",
       "humoral immune response mediated by circulating immunoglobulin",
+      "immunoglobulin mediated immune response",
       "regulation of humoral immune response",
+      "adaptive immune response based on somatic recombination of immune receptors built from immunoglobulin superfamily domains",
+      "somatic diversification of immune receptors via somatic mutation",
+      "regulation of adaptive immune response based on somatic recombination of immune receptors built from immunoglobulin superfamily domains"
+    ) ~ "Adaptive Immunity - B cells & Humoral",
+
+    # 6. Cytokine & Immune Signaling
+    description %in% c(
+      "cellular response to tumor necrosis factor",
+      "response to tumor necrosis factor",
+      "tumor necrosis factor production",
+      "regulation of tumor necrosis factor production",
+      "positive regulation of tumor necrosis factor superfamily cytokine production",
       "cytokine production involved in immune response",
       "positive regulation of cytokine production involved in immune response",
       "regulation of cytokine production involved in immune response",
       "production of molecular mediator of immune response",
       "regulation of production of molecular mediator of immune response",
-      "positive regulation of leukocyte mediated cytotoxicity"
-    ) ~ "Adaptive Immunity / Lymphocytes",
-    
-    # 4. Cytokine / TNF / Immune Signaling
-    description %in% c(
-      "cellular response to tumor necrosis factor",
-      "response to tumor necrosis factor",
-      "regulation of tumor necrosis factor production",
-      "positive regulation of tumor necrosis factor superfamily cytokine production",
-      "tumor necrosis factor production",
       "immune response-activating cell surface receptor signaling pathway",
       "immune response-regulating cell surface receptor signaling pathway",
       "innate immune response-activating signaling pathway",
       "regulation of innate immune response",
       "negative regulation of innate immune response",
       "negative regulation of immune response",
-      "negative regulation of immune effector process"
-    ) ~ "Cytokine / TNF / Immune Signaling",
-    
-    # 5. DNA / Cell Cycle / Apoptosis / Chromatin
+      "negative regulation of immune effector process",
+      "type 2 immune response",
+      "regulation of type 2 immune response",
+      "regulation of immune effector process",
+      "regulation of adaptive immune response",
+      "positive regulation of innate immune response",
+      "positive regulation of leukocyte activation",
+      "positive regulation of lymphocyte activation",
+      "cell activation involved in immune response",
+      "response to tumor cell",
+      "leukocyte mediated cytotoxicity",
+      "regulation of leukocyte mediated cytotoxicity",
+      "positive regulation of leukocyte mediated cytotoxicity",
+      "lymphocyte mediated immunity",
+      "regulation of lymphocyte proliferation",
+      "regulation of lymphocyte differentiation",
+      "positive regulation of lymphocyte differentiation",
+      "negative regulation of lymphocyte activation",
+      "lymphocyte proliferation",
+      "lymphocyte differentiation"
+    ) ~ "Cytokine & Immune Signaling",
+
+    # 7. Cell Cycle / DNA Damage / Apoptosis
     description %in% c(
       "positive regulation of DNA biosynthetic process",
       "regulation of DNA biosynthetic process",
@@ -511,41 +879,48 @@ immune_related <- immune_related %>%
       "DNA unwinding involved in DNA replication",
       "mitotic DNA replication",
       "nuclear DNA replication",
+      "DNA replication",
+      "regulation of DNA replication",
+      "DNA biosynthetic process",
+      "regulation of DNA-templated DNA replication",
+      "regulation of DNA-templated DNA replication initiation",
+      "DNA duplex unwinding",
+      "DNA geometric change",
+      "DNA-templated transcription elongation",
+      "regulation of DNA-templated transcription elongation",
       "DNA damage response, signal transduction by p53 class mediator",
       "regulation of DNA damage response, signal transduction by p53 class mediator",
       "negative regulation of DNA damage response, signal transduction by p53 class mediator",
       "protein-DNA complex disassembly",
+      "protein-DNA complex assembly",
       "DNA conformation change",
       "DNA repair-dependent chromatin remodeling",
+      "regulation of DNA repair",
       "DNA methylation-dependent heterochromatin formation",
+      "regulation of DNA methylation-dependent heterochromatin formation",
       "regulation of DNA binding",
       "negative regulation of DNA binding",
+      "regulation of DNA-binding transcription factor activity",
+      "positive regulation of DNA-binding transcription factor activity",
       "negative regulation of DNA-binding transcription factor activity",
+      "positive regulation of DNA metabolic process",
       "apoptotic DNA fragmentation",
+      "regulation of apoptotic DNA fragmentation",
       "negative regulation of intrinsic apoptotic signaling pathway in response to DNA damage",
-      "regulation of intrinsic apoptotic signaling pathway in response to DNA damage"
-    ) ~ "DNA / Cell Cycle / Apoptosis / Chromatin",
-    
-    # 6. Dendritic / Other Immune Functions
-    description %in% c(
-      "dendritic cell antigen processing and presentation",
-      "dendritic spine maintenance",
-      "regulation of dendritic cell antigen processing and presentation",
-      "regulation of dendritic spine maintenance",
-      "regulation of dendritic cell cytokine production",
-      "axo-dendritic transport"
-    ) ~ "Dendritic / Other Immune Functions",
-    
-    # Default group if not matched
+      "regulation of intrinsic apoptotic signaling pathway in response to DNA damage",
+      "intrinsic apoptotic signaling pathway in response to DNA damage"
+    ) ~ "Cell Cycle / DNA Damage / Apoptosis",
+
     TRUE ~ "Other / Miscellaneous"
   )) %>%
   mutate(group = factor(group, levels = c(
-    "Fibroblast / ECM / Wound Repair",
-    "Innate Immunity / Myeloid",
-    "Adaptive Immunity / Lymphocytes",
-    "Cytokine / TNF / Immune Signaling",
-    "DNA / Cell Cycle / Apoptosis / Chromatin",
-    "Dendritic / Other Immune Functions",
+    "Stromal / Fibroblast / Angiogenesis",
+    "Myeloid Innate Immunity",
+    "Antigen Presentation & Dendritic Cells",
+    "Adaptive Immunity - T cells",
+    "Adaptive Immunity - B cells & Humoral",
+    "Cytokine & Immune Signaling",
+    "Cell Cycle / DNA Damage / Apoptosis",
     "Other / Miscellaneous"
   )))
 
@@ -556,7 +931,7 @@ immune_related <- immune_related %>%
 ggplot(
   immune_related,
   aes(
-    x = sample,
+    x = ov04,
     y = description,
     size = prop_clusters
   )
@@ -581,7 +956,7 @@ ggplot(
     axis.title.y = element_blank()
   ) +
   guides(size = guide_legend(override.aes = list(alpha = 1)))
-ggsave(paste0(results, "immune_related.pdf"), width=15, height = 20)
+ggsave(paste0(nas, "/plots/immune_related.pdf"), width=15, height = 20)
 
 ```
 
@@ -596,7 +971,155 @@ ggplot(top_terms, aes(x = sample, y = Description)) +
   theme_minimal(base_size = 10) +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
-ggsave(paste0(results,"plots/immune_related.pdf"), width=12, height = 9)
+ggsave(paste0(nas,"/plots/immune_related.pdf"), width=12, height = 9)
 
 ```
 
+.....................................................................
+Subgroup pathway enrichment results plotting 
+ - pooled all DE genes per sample, per subgroup and ran pathway ORA on each subgroup, grouped by immune category and also by genomic category
+ 
+```{r, warning=FALSE, include=FALSE}
+effector_msigdb <- read_csv(paste0(nas, "ora_subgroup_Effector_dominant_msigdb_hallmark.csv")) 
+desert_msigdb <- read_csv(paste0(nas, "ora_subgroup_Immune_Desert_msigdb_hallmark.csv")) 
+mac_msigdb <- read_csv(paste0(nas, "ora_subgroup_Macrophage_dominant_msigdb_hallmark.csv")) 
+
+gbrca1_msigdb <- read_csv(paste0(nas, "ora_subgroup_gBRCA1m.csv")) 
+gbrca2_msigdb <- read_csv(paste0(nas, "ora_subgroup_gBRCA2m.csv")) 
+hrp_msigdb <- read_csv(paste0(nas, "ora_subgroup_HRP.csv")) 
+nonbrca_msigdb <- read_csv(paste0(nas, "ora_subgroup_non-BRCA-HRD.csv")) 
+```
+ 
+```{r}
+library(dplyr)
+library(tidyr)
+library(ComplexHeatmap)
+library(circlize)
+library(tibble)
+library(grid)
+
+# named lists of ORA tables
+immune_list <- list(
+  Effector_dominant   = effector_msigdb,
+  Immune_Desert       = desert_msigdb,
+  Macrophage_dominant = mac_msigdb
+)
+
+genotype_list <- list(
+  gBRCA1m       = gbrca1_msigdb,
+  gBRCA2m       = gbrca2_msigdb,
+  HRP           = hrp_msigdb,
+  `non-BRCA-HRD` = nonbrca_msigdb
+)
+
+# - df-list -> pathway x subgroup matrix
+ora_to_mat <- function(df_list, value = c("neglogFDR", "gene_ratio"), fill = 0) {
+  value <- match.arg(value)
+
+  long <- bind_rows(lapply(names(df_list), function(nm) {
+    df <- df_list[[nm]]
+    if (is.null(df) || nrow(df) == 0) return(NULL)
+
+    df %>%
+      transmute(
+        subgroup = nm,
+        pathway  = Description,
+        neglogFDR = -log10(p.adjust),
+        gene_ratio = {
+          # expects "k/n" strings
+          gr <- GeneRatio
+          num <- suppressWarnings(as.numeric(sub("/.*", "", gr)))
+          den <- suppressWarnings(as.numeric(sub(".*/", "", gr)))
+          num / den
+        }
+      )
+  }))
+
+  wide <- long %>%
+    select(subgroup, pathway, all_of(value)) %>%
+    distinct() %>%
+    pivot_wider(names_from = subgroup, values_from = all_of(value), values_fill = fill)
+
+  wide %>%
+    column_to_rownames("pathway") %>%
+    as.matrix()
+}
+
+# choose what to plot
+
+value_to_plot <- "neglogFDR"   # or "gene_ratio"
+
+cap_neglogFDR <- 10            # <- key: caps -log10(FDR) at 10 (i.e., 1e-10)
+
+immune_mat   <- ora_to_mat(immune_list,   value = value_to_plot, fill = 0)
+genotype_mat <- ora_to_mat(genotype_list, value = value_to_plot, fill = 0)
+
+# Optional: drop pathways absent everywhere
+drop_all_zero <- function(mat) mat[rowSums(mat > 0) > 0, , drop = FALSE]
+immune_mat   <- drop_all_zero(immune_mat)
+genotype_mat <- drop_all_zero(genotype_mat)
+
+# Cap only if we're plotting -log10(FDR)
+if (value_to_plot == "neglogFDR") {
+  immune_mat   <- pmin(immune_mat,   cap_neglogFDR)
+  genotype_mat <- pmin(genotype_mat, cap_neglogFDR)
+}
+
+
+plot_heat <- function(mat, title = "", cap = NULL) {
+  stopifnot(nrow(mat) > 0, ncol(mat) > 0)
+
+  if (value_to_plot == "neglogFDR") {
+    # fixed scale: 0 -> cap
+    col_fun <- colorRamp2(
+      c(0, cap/2, cap),
+      c("white", "pink", "#B2182B")
+    )
+    legend_name <- paste0("-log10(FDR) (capped at ", cap, ")")
+  } else {
+    # GeneRatio is already 0..~0.3 typically; use data-driven max
+    mmax <- max(mat, na.rm = TRUE)
+    col_fun <- colorRamp2(
+      c(0, mmax/2, mmax),
+      c("white", "lightblue", "#2166AC")
+    )
+    legend_name <- "GeneRatio"
+  }
+
+  Heatmap(
+    mat,
+    name = legend_name,
+    col = col_fun,
+    cluster_rows = TRUE,
+    cluster_columns = FALSE,
+    row_names_gp = gpar(fontsize = 8),
+    column_names_gp = gpar(fontsize = 10),
+    column_names_rot = 45,
+    column_title = title
+  )
+}
+
+ht_immune <- plot_heat(
+  immune_mat,
+  title = "Hallmark ORA — immune subgroups",
+  cap = if (value_to_plot == "neglogFDR") cap_neglogFDR else NULL
+)
+
+ht_genotype <- plot_heat(
+  genotype_mat,
+  title = "Hallmark ORA — genotype subgroups",
+  cap = if (value_to_plot == "neglogFDR") cap_neglogFDR else NULL
+)
+
+# Draw to screen
+draw(ht_immune)
+draw(ht_genotype)
+
+# Save to PDF
+pdf(file.path(nas, "hallmark_ORA_heatmaps_immune_vs_genotype.pdf"), width = 12, height = 10)
+draw(ht_immune)
+draw(ht_genotype)
+dev.off()
+
+```
+ 
